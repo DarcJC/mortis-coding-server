@@ -13,6 +13,7 @@
 - [构建与安装](#构建与安装)
 - [配置](#配置)
 - [运行](#运行)
+- [部署（Ubuntu）](#部署ubuntu)
 - [REST API 参考](#rest-api-参考)
 - [MCP 接入](#mcp-接入)
 - [会话语义（CoW）](#会话语义cow)
@@ -182,6 +183,84 @@ curl http://127.0.0.1:8080/health      # -> ok
 ```
 
 > 以下示例假设 `TOKEN=change-me`、服务在 `127.0.0.1:8080`。
+
+---
+
+## 部署（Ubuntu）
+
+`scripts/deploy-ubuntu.sh` 把服务一键部署为 **supervisord 守护进程**（仅适配 Ubuntu，其它系统会提前报错退出）。它会依次：apt 安装依赖（`subversion` 用于 SVN 后端、`python3`+`venv` 供 supervisor、`build-essential`/`cmake` 构建链，以及 `lldb`/`llvm`/`binutils` 汇编调试工具）、**从源码 `cargo build --release`**（缺 `cargo` 时自动装 rustup；**运行目录若不是 git 仓库，自动从 [`DarcJC/mortis-coding-server`](https://github.com/DarcJC/mortis-coding-server) 克隆源码**再编译）、创建专用系统用户 `mortis` 与 FHS 目录、生成 `config.toml`、用 pip+venv 安装 supervisor 并配置开机自启。脚本可**重复运行（幂等）**：覆盖配置并 `reread/update/restart`。
+
+### 一键部署（curl | bash）
+
+无需事先克隆仓库——脚本检测到当前目录非 git 仓库时会自动拉取源码：
+
+```bash
+# 交互式（在终端逐项询问监听地址 / 端口 / principal / token）
+curl -fsSL https://raw.githubusercontent.com/DarcJC/mortis-coding-server/main/scripts/deploy-ubuntu.sh | sudo bash
+
+# 静默：默认值 + 自动随机 token
+curl -fsSL https://raw.githubusercontent.com/DarcJC/mortis-coding-server/main/scripts/deploy-ubuntu.sh | sudo bash -s -- --no-prompt
+
+# 静默 + 指定参数
+curl -fsSL https://raw.githubusercontent.com/DarcJC/mortis-coding-server/main/scripts/deploy-ubuntu.sh \
+  | sudo bash -s -- --no-prompt --bind 0.0.0.0:9000 --principal alice --token s3cr3t
+```
+
+> 用管道把脚本喂给 `sudo bash` 前，建议先过目脚本内容。此方式下源码默认克隆到构建用户家目录的 `mortis-code-server-src/`，可用 `--repo-url` 指定其它源。
+
+### 从已克隆的仓库部署
+
+```bash
+# 交互式：逐项询问监听地址 / 端口 / principal / token（默认随机）
+sudo ./scripts/deploy-ubuntu.sh
+
+# 静默：用默认值 + 自动随机 token
+sudo ./scripts/deploy-ubuntu.sh --no-prompt
+
+# 静默 + 指定参数
+sudo ./scripts/deploy-ubuntu.sh --no-prompt --bind 0.0.0.0:9000 --principal alice --token s3cr3t
+```
+
+### 命令行参数
+
+| 参数 | 说明（默认值） |
+|---|---|
+| `--no-prompt` | 静默安装，不交互；无 `--token` 时自动随机 |
+| `--bind <addr:port>` | 监听地址（`0.0.0.0:8080`），等价于同时给 `--host`+`--port` |
+| `--host` / `--port` | 分别指定监听地址 / 端口 |
+| `--token <值\|random>` | 认证 token；填 `random` 或留空表示随机生成 |
+| `--principal <name>` | token 归属（`admin`） |
+| `--data-dir <path>` | 数据目录（`/var/lib/mortis-code-server`） |
+| `--install-dir <path>` | 安装前缀（`/opt/mortis-code-server`） |
+| `--config <path>` | 配置路径（`/etc/mortis-code-server/config.toml`） |
+| `--user <name>` | 运行服务的系统用户（`mortis`） |
+| `--skip-build` | 复用已有 `target/release` 二进制，跳过编译 |
+| `--repo-url <url>` | 源码非 git 仓库时的克隆地址（默认 `…/DarcJC/mortis-coding-server.git`） |
+| `-h, --help` | 显示帮助 |
+
+### 安装布局
+
+| 路径 | 内容 |
+|---|---|
+| `/opt/mortis-code-server/bin/mortis-code-server` | 二进制 |
+| `/etc/mortis-code-server/config.toml` | 配置（`0640`，属 `mortis`） |
+| `/var/lib/mortis-code-server` | 数据目录（`data_dir`） |
+| `/var/log/mortis-code-server/{stdout,stderr}.log` | 运行日志 |
+| `/etc/supervisor/conf.d/mortis-code-server.conf` | supervisor 程序配置 |
+
+### 开机自启（兼容无 systemd）
+
+按运行环境三级回退：有 **systemd** → 写 `supervisord.service` 并 `enable`；否则有 **cron** → 写 root 的 `@reboot` 启动项；都没有（纯容器）→ 立即启动并提示把 `supervisord -c /etc/supervisor/supervisord.conf` 加进容器 entrypoint。
+
+### 运维命令
+
+```bash
+supervisorctl status                          # 查看状态
+supervisorctl restart mortis-code-server      # 改完 config.toml 后重启
+supervisorctl tail -f mortis-code-server stderr
+```
+
+> `lldb` / `llvm`（`llvm-objdump` 等）/ `binutils`（`objdump`/`readelf`）由脚本一并预装，供下一阶段「命令执行沙箱」调试二进制汇编。
 
 ---
 
