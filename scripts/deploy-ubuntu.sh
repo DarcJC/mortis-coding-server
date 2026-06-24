@@ -11,7 +11,8 @@
 #      `cargo build --release` 并更新二进制，随后按需经 supervisorctl 重启服务
 #      （缺 cargo 自动装 rustup；REPO_ROOT 非 git 仓库时，自动从 --repo-url 克隆）。
 #   4. 创建专用系统用户 mortis 与 FHS 目录布局，安装二进制（setcap 授予绑定
-#      <1024 特权端口能力，使非 root 的 mortis 可监听 80/443）+ 生成 config.toml。
+#      <1024 特权端口能力，使非 root 的 mortis 可监听 80/443）+ 生成 config.toml
+#      （配置已存在则默认保留不动，需重写请加 --reconfigure）。
 #   5. 用 pip+venv 安装 supervisor（规避 PEP 668），写好 supervisord/程序配置。
 #   6. 配置开机自启：systemd → cron @reboot → 手动 三级回退（兼容无 systemd）。
 #
@@ -51,6 +52,7 @@ SUPERVISORCTL="/usr/local/bin/supervisorctl"
 # ---- 运行时变量（命令行解析后填充） -----------------------------------------
 PROMPT=1
 SKIP_BUILD=0
+RECONFIGURE=0
 BIND=""
 HOST=""
 PORT=""
@@ -67,6 +69,7 @@ REPO_URL=""
 SOURCE_UPDATED=0    # git pull 拉到新提交（或全新克隆）时置 1 → 触发重新编译
 BINARY_UPDATED=0    # 安装目录中的二进制内容发生变化时置 1 → 需要重启
 CONFIG_CHANGED=0    # config.toml 内容发生变化时置 1 → 需要重启
+CONFIG_PRESERVE=0   # 已存在 config.toml 且未加 --reconfigure 时置 1 → 跳过配置生成
 
 # ---- 日志辅助 ---------------------------------------------------------------
 c_reset=$'\033[0m'; c_blue=$'\033[1;34m'; c_green=$'\033[1;32m'
@@ -98,6 +101,7 @@ mortis-code-server 部署脚本（仅 Ubuntu）
   --config <path>     配置文件路径 (默认 /etc/mortis-code-server/config.toml)
   --user <name>       运行服务的系统用户 (默认 mortis)
   --skip-build        若已存在 target/release 二进制则跳过编译（重复部署提速）
+  --reconfigure       已有配置文件时强制重走配置流程并覆盖（默认保留现有配置不动）
   --repo-url <url>    源码非 git 仓库时的克隆地址
                       (默认 https://github.com/DarcJC/mortis-coding-server.git)
   -h, --help          显示本帮助
@@ -117,6 +121,7 @@ parse_args() {
     case "$arg" in
       --no-prompt)  PROMPT=0 ;;
       --skip-build) SKIP_BUILD=1 ;;
+      --reconfigure) RECONFIGURE=1 ;;
       -h|--help)    usage; trap - EXIT; exit 0 ;;
       --bind|--host|--port|--token|--principal|--data-dir|--install-dir|--config|--user|--repo-url)
         if [ -z "$val" ]; then
@@ -379,8 +384,48 @@ ask_secret() {
   printf '%s' "$ans"
 }
 
+# ---- 从已有配置解析展示用参数（保留模式：不交互/不生成，仍在总结里显示真实值） ----
+# 仅针对本脚本自己生成的 config.toml 格式做轻量解析；解析失败的字段留空，由调用方兜底。
+parse_existing_config() {
+  local f="$CONFIG_PATH" bind line t p
+  [ -r "$f" ] || return 0
+
+  # [server] 段的 bind = "host:port"
+  bind="$(sed -n 's/^[[:space:]]*bind[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$f" | head -n1)"
+  if [ -n "$bind" ]; then
+    HOST="${bind%:*}"; PORT="${bind##*:}"
+  fi
+
+  # [auth] 段第一条 { token = "...", principal = "..." }
+  line="$(grep -E '^[[:space:]]*\{[[:space:]]*token[[:space:]]*=' "$f" | head -n1)"
+  if [ -n "$line" ]; then
+    t="$(printf '%s' "$line" | sed -n 's/.*token[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*,[[:space:]]*principal.*/\1/p')"
+    p="$(printf '%s' "$line" | sed -n 's/.*principal[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*}.*/\1/p')"
+    # TOML 基本字符串反转义：先 \" → "，再 \\ → \
+    t="${t//\\\"/\"}"; t="${t//\\\\/\\}"
+    p="${p//\\\"/\"}"; p="${p//\\\\/\\}"
+    [ -n "$t" ] && TOKEN="$t"
+    [ -n "$p" ] && PRINCIPAL="$p"
+  fi
+}
+
 # ---- 解析最终参数（交互或静默） ---------------------------------------------
 resolve_params() {
+  # 已存在配置且未要求重新配置 → 保留模式：不交互、不生成，改从现有配置解析展示值
+  if [ -f "$CONFIG_PATH" ] && [ "$RECONFIGURE" -eq 0 ]; then
+    CONFIG_PRESERVE=1
+    info "检测到已有配置，保留不动：$CONFIG_PATH（如需重新配置并覆盖，请加 --reconfigure）"
+    parse_existing_config
+    # 解析失败时兜底，确保后续 setcap 端口校验与收尾总结不报错
+    HOST="${HOST:-$BIND_HOST_DEFAULT}"
+    PRINCIPAL="${PRINCIPAL:-$PRINCIPAL_DEFAULT}"
+    case "$PORT" in
+      *[!0-9]*|'') warn "未能从现有配置解析出有效端口，端口相关校验改用默认值 $BIND_PORT_DEFAULT。"
+                   PORT="$BIND_PORT_DEFAULT" ;;
+    esac
+    return
+  fi
+
   # --bind 优先拆分为 host/port
   if [ -n "$BIND" ]; then
     HOST="${BIND%:*}"; PORT="${BIND##*:}"
@@ -422,6 +467,10 @@ resolve_params() {
 
 # ---- 生成 config.toml -------------------------------------------------------
 write_config() {
+  if [ "$CONFIG_PRESERVE" -eq 1 ]; then
+    info "保留现有配置，跳过生成：$CONFIG_PATH"
+    return
+  fi
   # TOML 字符串转义：反斜杠与双引号
   local tok="$TOKEN" prin="$PRINCIPAL"
   tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"
@@ -644,12 +693,22 @@ print_summary() {
   printf '监听地址 : http://%s:%s%s\n' "$HOST" "$PORT" "$exposed_note"
   printf '          REST → /api/v1    MCP → /mcp\n'
   printf 'principal: %s\n' "$PRINCIPAL"
-  printf 'token    : %s\n' "$TOKEN"
-  [ "$TOKEN_RANDOM" -eq 1 ] && printf '           （随机生成，已写入配置；请妥善保存）\n'
-  printf '调用示例 : curl -H "Authorization: Bearer %s" http://%s:%s/api/v1/repos\n' "$TOKEN" "$HOST" "$PORT"
+  if [ -n "$TOKEN" ]; then
+    printf 'token    : %s\n' "$TOKEN"
+    [ "$TOKEN_RANDOM" -eq 1 ] && printf '           （随机生成，已写入配置；请妥善保存）\n'
+    [ "$CONFIG_PRESERVE" -eq 1 ] && printf '           （读取自现有配置）\n'
+    printf '调用示例 : curl -H "Authorization: Bearer %s" http://%s:%s/api/v1/repos\n' "$TOKEN" "$HOST" "$PORT"
+  else
+    printf 'token    : （未能从现有配置解析，请查看 %s）\n' "$CONFIG_PATH"
+    printf '调用示例 : curl -H "Authorization: Bearer <token>" http://%s:%s/api/v1/repos\n' "$HOST" "$PORT"
+  fi
   printf '\n路径:\n'
   printf '  二进制   %s/bin/mortis-code-server\n' "$INSTALL_DIR"
-  printf '  配置     %s\n' "$CONFIG_PATH"
+  if [ "$CONFIG_PRESERVE" -eq 1 ]; then
+    printf '  配置     %s （已保留，未改动；加 --reconfigure 可重新生成）\n' "$CONFIG_PATH"
+  else
+    printf '  配置     %s\n' "$CONFIG_PATH"
+  fi
   printf '  数据     %s\n' "$DATA_DIR"
   printf '  日志     %s/{stdout,stderr}.log\n' "$LOG_DIR"
   printf '  运行用户 %s\n' "$SVC_USER"
