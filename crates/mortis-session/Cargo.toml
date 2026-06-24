@@ -10,6 +10,7 @@ description = "Copy-on-write session overlay with status/diff/patch, persistence
 mortis-core = { workspace = true }
 mortis-fs = { workspace = true }
 similar = { workspace = true }
+diffy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 camino = { workspace = true }

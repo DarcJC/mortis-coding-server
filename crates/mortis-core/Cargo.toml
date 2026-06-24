@@ -14,3 +14,5 @@ async-trait = { workspace = true }
 camino = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
+# JsonSchema for request-arg types reused by the MCP layer (e.g. `Replacement`).
+schemars = { workspace = true }

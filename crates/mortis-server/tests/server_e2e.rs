@@ -3,6 +3,7 @@
 //! light MCP-endpoint auth check.
 
 use std::process::Command;
+use std::time::Duration;
 
 use axum::{
     Router,
@@ -15,7 +16,7 @@ use tower::ServiceExt;
 
 use mortis_core::config::{RepoConfig, VcsKind};
 use mortis_core::RepoId;
-use mortis_server::config::{AuthConfig, Config, ServerConfig, SessionConfig, TokenEntry};
+use mortis_server::config::{AsmConfig, AuthConfig, Config, ServerConfig, SessionConfig, TokenEntry};
 use mortis_server::{build_app, build_services};
 
 fn u(p: &std::path::Path) -> Utf8PathBuf {
@@ -76,6 +77,13 @@ impl Client {
         (s, serde_json::from_slice(&b).unwrap_or(Value::Null))
     }
 
+    async fn patch_json(&self, uri: &str, token: &str, body: Value) -> (StatusCode, Value) {
+        let (s, b) = self
+            .send("PATCH", uri, Some(token), Body::from(body.to_string()), Some("application/json"))
+            .await;
+        (s, serde_json::from_slice(&b).unwrap_or(Value::Null))
+    }
+
     /// Send a JSON-RPC message to the MCP endpoint (stateless JSON mode).
     async fn mcp(&self, token: &str, body: Value) -> (StatusCode, Value) {
         let req = Request::builder()
@@ -105,6 +113,47 @@ fn make_fixture(remote: &Utf8Path) {
     std::fs::write(remote.join("src/a.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
     git(remote, &["add", "."]);
     git(remote, &["commit", "-qm", "c2"]);
+}
+
+/// A valid little ELF (relocatable, `.text` = `push rbp; mov rbp,rsp; ret`,
+/// with a function symbol `f`) for the assembly-session e2e test.
+fn elf_fixture() -> Vec<u8> {
+    use object::write::{Object, StandardSection, Symbol, SymbolSection};
+    use object::{Architecture, BinaryFormat, Endianness, SymbolFlags, SymbolKind, SymbolScope};
+    let code = [0x55u8, 0x48, 0x89, 0xe5, 0xc3];
+    let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = obj.section_id(StandardSection::Text);
+    obj.append_section_data(text, &code, 1);
+    obj.add_symbol(Symbol {
+        name: b"f".to_vec(),
+        value: 0,
+        size: code.len() as u64,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+    obj.write().unwrap()
+}
+
+/// Spawn a local HTTP server serving the ELF fixture at `/bin`.
+async fn spawn_bin_server() -> String {
+    use axum::routing::get;
+    let elf = elf_fixture();
+    let app = Router::new().route(
+        "/bin",
+        get(move || {
+            let b = elf.clone();
+            async move { b }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://127.0.0.1:{}", addr.port())
 }
 
 fn config_for(root: &Utf8Path, remote: &Utf8Path) -> Config {
@@ -137,6 +186,7 @@ fn config_for(root: &Utf8Path, remote: &Utf8Path) -> Config {
             ttl: "24h".into(),
             reap_interval: "10m".into(),
         },
+        asm: AsmConfig::default(),
     }
 }
 
@@ -255,6 +305,138 @@ async fn rest_end_to_end_flow() {
 }
 
 #[tokio::test]
+async fn session_edit_via_patch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = u(tmp.path());
+    let remote = root.join("remote");
+    make_fixture(&remote);
+    let (state, services) = build_services(config_for(&root, &remote)).unwrap();
+    services.sync_repo(&RepoId::from("proj")).await.unwrap();
+    let client = Client { app: build_app(state) };
+
+    let (s, sess) = client.post_json("/api/v1/sessions", "alice-tok", json!({"repo":"proj"})).await;
+    assert_eq!(s, StatusCode::OK);
+    let sid = sess["id"].as_str().unwrap().to_string();
+
+    // search/replace edit (base src/a.rs has `fn b() {}`)
+    let (s, out) = client
+        .patch_json(
+            &format!("/api/v1/sessions/{sid}/file?path=src/a.rs"),
+            "alice-tok",
+            json!({"edits":[{"search":"fn b() {}","replace":"fn b() { /* edited */ }"}]}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(out["change"], "modified");
+    assert_eq!(out["applied"], 1);
+
+    let (s, fc) = client
+        .get_json(&format!("/api/v1/sessions/{sid}/file?path=src/a.rs"), "alice-tok")
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(fc["text"].as_str().unwrap().contains("/* edited */"));
+
+    // unified-diff edit on a pristine file (README.md == "# proj\n")
+    let diff = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-# proj\n+# project\n";
+    let (s, _) = client
+        .patch_json(
+            &format!("/api/v1/sessions/{sid}/file?path=README.md"),
+            "alice-tok",
+            json!({ "diff": diff }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // both `diff` and `edits` → 400
+    let (s, _) = client
+        .patch_json(
+            &format!("/api/v1/sessions/{sid}/file?path=README.md"),
+            "alice-tok",
+            json!({"diff":"x","edits":[]}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // a diff that does not apply → 409
+    let bad = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-no such line\n+x\n";
+    let (s, _) = client
+        .patch_json(
+            &format!("/api/v1/sessions/{sid}/file?path=src/a.rs"),
+            "alice-tok",
+            json!({ "diff": bad }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn asm_session_end_to_end() {
+    let base = spawn_bin_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = u(tmp.path());
+    let remote = root.join("remote");
+    make_fixture(&remote);
+    let mut config = config_for(&root, &remote);
+    config.asm.allowed_hosts = vec!["127.0.0.1".into()];
+    let (state, _services) = build_services(config).unwrap();
+    let client = Client { app: build_app(state) };
+
+    // create over an allowlisted host
+    let (s, sess) = client
+        .post_json("/api/v1/asm/sessions", "alice-tok", json!({"url": format!("{base}/bin")}))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(sess["owner"], "alice");
+    let aid = sess["id"].as_str().unwrap().to_string();
+
+    // poll status until validated
+    let mut ready = false;
+    for _ in 0..200 {
+        let (s, st) = client.get_json(&format!("/api/v1/asm/sessions/{aid}"), "alice-tok").await;
+        assert_eq!(s, StatusCode::OK);
+        match st["status"]["state"].as_str() {
+            Some("ready") => {
+                ready = true;
+                break;
+            }
+            Some("failed") => panic!("asm session failed: {st}"),
+            _ => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    assert!(ready, "asm session never became ready");
+
+    // metadata, disasm, address→function all go through the REST surface
+    let (s, meta) = client
+        .get_json(&format!("/api/v1/asm/sessions/{aid}/metadata"), "alice-tok")
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(meta["os"], "linux");
+    assert_eq!(meta["arch"], "x86_64");
+
+    let (s, dis) = client
+        .get_json(&format!("/api/v1/asm/sessions/{aid}/disasm?start=0&len=5"), "alice-tok")
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(dis["instructions"][0]["mnemonic"], "push");
+
+    let (s, f) = client
+        .get_json(&format!("/api/v1/asm/sessions/{aid}/function?address=0"), "alice-tok")
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(f["name"], "f");
+
+    // owner isolation: bob cannot see alice's session
+    let (s, _) = client.get_json(&format!("/api/v1/asm/sessions/{aid}"), "bob-tok").await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // a non-allowlisted host is rejected
+    let (s, _) = client
+        .post_json("/api/v1/asm/sessions", "alice-tok", json!({"url":"http://example.com/x"}))
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn mcp_endpoint_requires_auth() {
     let tmp = tempfile::tempdir().unwrap();
     let root = u(tmp.path());
@@ -323,6 +505,9 @@ async fn mcp_tools_end_to_end() {
     assert!(names.contains(&"search_code"));
     assert!(names.contains(&"read_file"));
     assert!(names.contains(&"create_session"));
+    assert!(names.contains(&"edit_file"));
+    assert!(names.contains(&"create_asm_session"));
+    assert!(names.contains(&"asm_disassemble"));
     assert!(names.len() >= 12, "expected the full tool set, got {names:?}");
 
     // tools/call search_code returns JSON text content with the match

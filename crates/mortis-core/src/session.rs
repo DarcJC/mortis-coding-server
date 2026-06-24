@@ -49,6 +49,50 @@ pub struct FileStatus {
     pub change: ChangeKind,
 }
 
+/// One exact-match search/replace edit applied to a file's current content.
+///
+/// `search` is matched literally (not a regex). With `all == false` the search
+/// text must occur exactly once — zero matches or an ambiguous match is an
+/// error, so an edit can never silently land in the wrong place. An empty
+/// `search` is only valid as the sole edit creating a brand-new file (its
+/// `replace` becomes the whole content).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Replacement {
+    /// Literal text to find in the current file content.
+    pub search: String,
+    /// Text to substitute for `search`.
+    pub replace: String,
+    /// Replace every occurrence instead of requiring a unique match.
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// How to edit a file in place: either a strict unified diff or an ordered set
+/// of exact search/replace blocks. Both are applied to the file's *current*
+/// view (upper layer if present, else the base), atomically inside the store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileEdit {
+    /// A standard/unified (git-style) diff. Applied strictly: context must match
+    /// exactly or the whole edit fails with [`CoreError::Conflict`].
+    UnifiedDiff(String),
+    /// A sequence of literal search/replace edits, applied in order.
+    SearchReplace(Vec<Replacement>),
+}
+
+/// The result of an [`SessionStore::edit_file`] application.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditOutcome {
+    /// The (sanitized) path that was written.
+    pub path: Utf8PathBuf,
+    /// Whether the edit created the file or modified an existing one.
+    pub change: ChangeKind,
+    /// Size of the resulting file in bytes.
+    pub bytes: usize,
+    /// Number of hunks (unified diff) or replacements (search/replace) applied.
+    pub applied: usize,
+}
+
 /// The copy-on-write session layer.
 ///
 /// Methods that read or write a session also refresh its `last_accessed`
@@ -75,6 +119,21 @@ pub trait SessionStore: Send + Sync {
 
     /// Write (create or overwrite) a file in the session's upper layer.
     async fn write_file(&self, id: &SessionId, path: &Utf8Path, content: &[u8]) -> Result<()>;
+
+    /// Apply an in-place [`FileEdit`] to a file and write the result into the
+    /// upper layer.
+    ///
+    /// The read-of-current-content, apply, and write MUST be atomic: the
+    /// implementation has to hold the same lock as [`write_file`] across the
+    /// whole read-modify-write so a concurrent writer cannot interleave. A diff
+    /// that does not apply cleanly (or an unsatisfiable search/replace) fails
+    /// with [`CoreError::Conflict`] and leaves the session untouched.
+    async fn edit_file(
+        &self,
+        id: &SessionId,
+        path: &Utf8Path,
+        edit: FileEdit,
+    ) -> Result<EditOutcome>;
 
     /// Delete a file from the session view (whiteout if it exists in the base).
     async fn delete_file(&self, id: &SessionId, path: &Utf8Path) -> Result<()>;

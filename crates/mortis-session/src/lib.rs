@@ -35,7 +35,9 @@ use similar::TextDiff;
 
 use mortis_core::error::{CoreError, Result};
 use mortis_core::model::{Principal, RepoId, SessionId, Timestamp};
-use mortis_core::session::{ChangeKind, FileStatus, Session, SessionStore};
+use mortis_core::session::{
+    ChangeKind, EditOutcome, FileEdit, FileStatus, Replacement, Session, SessionStore,
+};
 use mortis_core::view::FileView;
 use mortis_fs::{OverlayFileView, PhysicalFileView};
 
@@ -214,6 +216,98 @@ fn append_file_diff(
     }
 }
 
+/// Apply a strict unified diff to `current`, returning the new content and the
+/// number of hunks applied.
+///
+/// The diff may carry a leading `diff --git a/… b/…` line (that is exactly what
+/// this store's own `diff`/`export_patch` emit); `diffy` only understands the
+/// `---`/`+++`/`@@` body, so those extended-header lines are stripped first. A
+/// parse failure is [`CoreError::InvalidInput`]; a context mismatch (the diff
+/// does not apply against `current`) is [`CoreError::Conflict`].
+fn apply_unified_diff(current: &str, diff_text: &str) -> Result<(String, usize)> {
+    let mut body: String = diff_text
+        .lines()
+        .filter(|l| !l.starts_with("diff --git "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // `lines()` drops the final newline; restore it so the last hunk's trailing
+    // context/`\ No newline` marker is interpreted the same as it was emitted.
+    if diff_text.ends_with('\n') {
+        body.push('\n');
+    }
+
+    let patch = diffy::Patch::from_str(&body)
+        .map_err(|e| CoreError::invalid(format!("malformed unified diff: {e}")))?;
+    let applied = patch.hunks().len();
+    // `diffy` parses arbitrary text (including garbage) as a patch with zero
+    // hunks and "applies" it as a no-op. Reject that: a unified diff with no
+    // hunks is either malformed input or a meaningless empty edit.
+    if applied == 0 {
+        return Err(CoreError::invalid(
+            "unified diff contains no hunks (not a valid diff)",
+        ));
+    }
+    let new = diffy::apply(current, &patch)
+        .map_err(|e| CoreError::Conflict(format!("diff does not apply cleanly: {e}")))?;
+    Ok((new, applied))
+}
+
+/// Apply an ordered list of literal search/replace edits to `current`.
+///
+/// `exists` reports whether the file currently exists in the session view. A
+/// single empty-`search` block creates a brand-new file (its `replace` becomes
+/// the whole content) and is rejected if the file already exists. Otherwise
+/// each block's `search` must occur exactly once (or every occurrence when
+/// `all` is set); zero or ambiguous matches fail with [`CoreError::Conflict`]
+/// so an edit can never silently land in the wrong place.
+fn apply_search_replace(
+    current: &str,
+    exists: bool,
+    blocks: &[Replacement],
+) -> Result<(String, usize)> {
+    if blocks.is_empty() {
+        return Err(CoreError::invalid("no edits provided"));
+    }
+
+    // New-file creation: a lone empty-search block sets the whole content.
+    if blocks.len() == 1 && blocks[0].search.is_empty() {
+        if exists {
+            return Err(CoreError::Conflict(
+                "empty search creates a new file, but the file already exists".into(),
+            ));
+        }
+        return Ok((blocks[0].replace.clone(), 1));
+    }
+
+    let mut acc = current.to_string();
+    let mut applied = 0usize;
+    for (i, b) in blocks.iter().enumerate() {
+        if b.search.is_empty() {
+            return Err(CoreError::invalid(format!(
+                "edit {i}: empty search is only allowed as the sole edit creating a new file"
+            )));
+        }
+        let count = acc.matches(&b.search).count();
+        match count {
+            0 => return Err(CoreError::Conflict(format!("edit {i}: search text not found"))),
+            _ if b.all => {
+                acc = acc.replace(&b.search, &b.replace);
+                applied += count;
+            }
+            1 => {
+                acc = acc.replacen(&b.search, &b.replace, 1);
+                applied += 1;
+            }
+            n => {
+                return Err(CoreError::Conflict(format!(
+                    "edit {i}: search matches {n} times; set all=true to replace every occurrence"
+                )));
+            }
+        }
+    }
+    Ok((acc, applied))
+}
+
 impl DiskSessionStore {
     /// Compute the status entries for a loaded record (shared by status/diff).
     ///
@@ -259,6 +353,33 @@ impl DiskSessionStore {
 
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
+    }
+
+    /// Resolve the current content of `safe` through the overlay, returning the
+    /// bytes and whether the file currently exists in the view.
+    ///
+    /// Mirrors [`OverlayFileView`] resolution order (upper → whiteout → base)
+    /// but reads directly from the loaded record so callers can run it *inside*
+    /// the write lock (unlike `view()`, which re-loads lock-free). A
+    /// non-existent file resolves to empty bytes with `exists = false`.
+    fn current_overlay_bytes(
+        &self,
+        rec: &SessionRecord,
+        safe: &Utf8Path,
+    ) -> Result<(Vec<u8>, bool)> {
+        let upper_path = self.upper_dir(&rec.session.id).join(safe);
+        if upper_path.is_file() {
+            return Ok((std::fs::read(&upper_path)?, true));
+        }
+        // Whited-out base files read as absent.
+        if rec.deleted.iter().any(|p| p == safe) {
+            return Ok((Vec::new(), false));
+        }
+        let base = PhysicalFileView::new(rec.session.base_path.clone());
+        match base.resolve(safe)? {
+            Some(_) => Ok((base.read(safe)?, true)),
+            None => Ok((Vec::new(), false)),
+        }
     }
 }
 
@@ -360,6 +481,61 @@ impl SessionStore for DiskSessionStore {
         rec.session.last_accessed = Timestamp::now();
         self.store_record(&rec)?;
         Ok(())
+    }
+
+    async fn edit_file(
+        &self,
+        id: &SessionId,
+        path: &Utf8Path,
+        edit: FileEdit,
+    ) -> Result<EditOutcome> {
+        let safe = sanitize(path)?;
+        // Same lock as `write_file`/`delete_file`: the read of the current
+        // content, the apply, and the write are one atomic critical section, so
+        // a concurrent mutation can't interleave a torn read-modify-write.
+        let _guard = self.write_lock.lock().await;
+
+        let mut rec = self.load_record(id)?;
+        let (current, exists) = self.current_overlay_bytes(&rec, &safe)?;
+
+        // Edits are line/text oriented (diffy and search/replace both operate on
+        // `&str`); refuse binary/non-UTF-8 content rather than corrupt it.
+        let current_str = std::str::from_utf8(&current)
+            .map_err(|_| CoreError::invalid("cannot edit a non-UTF-8 file"))?;
+
+        let (new_content, applied) = match edit {
+            FileEdit::UnifiedDiff(d) => apply_unified_diff(current_str, &d)?,
+            FileEdit::SearchReplace(blocks) => {
+                apply_search_replace(current_str, exists, &blocks)?
+            }
+        };
+
+        // Write the result into the upper layer.
+        let dest = self.upper_dir(id).join(&safe);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, new_content.as_bytes())?;
+
+        // Added vs Modified is determined by base presence (matches status/diff).
+        let base = PhysicalFileView::new(rec.session.base_path.clone());
+        let change = if base.resolve(&safe)?.is_some() {
+            ChangeKind::Modified
+        } else {
+            ChangeKind::Added
+        };
+
+        // An edit also "un-deletes" a whited-out path, like a plain write.
+        rec.deleted.retain(|p| p != &safe);
+        rec.session.last_accessed = Timestamp::now();
+        self.store_record(&rec)?;
+
+        Ok(EditOutcome {
+            path: safe,
+            change,
+            bytes: new_content.len(),
+            applied,
+        })
     }
 
     async fn delete_file(&self, id: &SessionId, path: &Utf8Path) -> Result<()> {
@@ -819,6 +995,274 @@ mod tests {
             .await
             .unwrap();
         assert!(d.is_empty(), "unchanged file should produce no diff: {d:?}");
+    }
+
+    #[tokio::test]
+    async fn edit_unified_diff_applies() {
+        let fx = fixture();
+        let (store, s) = store_with_session(&fx).await;
+        // base src/a.rs == "base-a\n".
+        let diff = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-base-a\n+edited-a\n";
+        let out = store
+            .edit_file(
+                &s.id,
+                Utf8Path::new("src/a.rs"),
+                FileEdit::UnifiedDiff(diff.to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.change, ChangeKind::Modified);
+        assert_eq!(out.applied, 1);
+        let view = store.view(&s.id).await.unwrap();
+        assert_eq!(view.read(Utf8Path::new("src/a.rs")).unwrap(), b"edited-a\n");
+    }
+
+    #[tokio::test]
+    async fn diffy_roundtrip_vs_similar() {
+        // The diff the store EMITS (via `similar`) must be consumable by the
+        // edit path (`diffy`) after the `diff --git` line is stripped.
+        let fx = fixture();
+        let (store, a) = store_with_session(&fx).await;
+        store
+            .write_file(&a.id, Utf8Path::new("src/a.rs"), b"line1\nline2\nline3\n")
+            .await
+            .unwrap();
+        let diff = store
+            .diff(&a.id, Some(Utf8Path::new("src/a.rs")))
+            .await
+            .unwrap();
+        assert!(diff.contains("diff --git"), "{diff}");
+
+        // A fresh session over the same base: apply that emitted diff.
+        let b = store
+            .create(
+                &Principal("alice".into()),
+                &RepoId("repo-a".into()),
+                "deadbeef",
+                &fx.base,
+            )
+            .await
+            .unwrap();
+        let out = store
+            .edit_file(&b.id, Utf8Path::new("src/a.rs"), FileEdit::UnifiedDiff(diff))
+            .await
+            .unwrap();
+        assert_eq!(out.change, ChangeKind::Modified);
+        let view = store.view(&b.id).await.unwrap();
+        assert_eq!(
+            view.read(Utf8Path::new("src/a.rs")).unwrap(),
+            b"line1\nline2\nline3\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_diff_context_mismatch_is_conflict() {
+        let fx = fixture();
+        let (store, s) = store_with_session(&fx).await;
+        // Removed line does not match the base ("base-a") => apply must fail.
+        let bad = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-not-the-base\n+whatever\n";
+        let err = store
+            .edit_file(
+                &s.id,
+                Utf8Path::new("src/a.rs"),
+                FileEdit::UnifiedDiff(bad.to_string()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Conflict(_)), "got {err:?}");
+        // The file is untouched.
+        let view = store.view(&s.id).await.unwrap();
+        assert_eq!(view.read(Utf8Path::new("src/a.rs")).unwrap(), b"base-a\n");
+    }
+
+    #[tokio::test]
+    async fn edit_malformed_diff_is_invalid() {
+        let fx = fixture();
+        let (store, s) = store_with_session(&fx).await;
+        let err = store
+            .edit_file(
+                &s.id,
+                Utf8Path::new("src/a.rs"),
+                FileEdit::UnifiedDiff("this is not a diff".to_string()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidInput(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn search_replace_single() {
+        let fx = fixture();
+        let (store, s) = store_with_session(&fx).await;
+        let out = store
+            .edit_file(
+                &s.id,
+                Utf8Path::new("src/a.rs"),
+                FileEdit::SearchReplace(vec![Replacement {
+                    search: "base-a".into(),
+                    replace: "replaced".into(),
+                    all: false,
+                }]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.applied, 1);
+        assert_eq!(out.change, ChangeKind::Modified);
+        let view = store.view(&s.id).await.unwrap();
+        assert_eq!(view.read(Utf8Path::new("src/a.rs")).unwrap(), b"replaced\n");
+    }
+
+    #[tokio::test]
+    async fn search_replace_not_found_is_conflict() {
+        let fx = fixture();
+        let (store, s) = store_with_session(&fx).await;
+        let err = store
+            .edit_file(
+                &s.id,
+                Utf8Path::new("src/a.rs"),
+                FileEdit::SearchReplace(vec![Replacement {
+                    search: "nonexistent".into(),
+                    replace: "x".into(),
+                    all: false,
+                }]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn search_replace_ambiguous_then_all() {
+        let fx = fixture();
+        let (store, s) = store_with_session(&fx).await;
+        store
+            .write_file(&s.id, Utf8Path::new("dup.txt"), b"x\nx\n")
+            .await
+            .unwrap();
+        // Two matches without `all` is ambiguous => Conflict.
+        let err = store
+            .edit_file(
+                &s.id,
+                Utf8Path::new("dup.txt"),
+                FileEdit::SearchReplace(vec![Replacement {
+                    search: "x".into(),
+                    replace: "y".into(),
+                    all: false,
+                }]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Conflict(_)), "got {err:?}");
+        // With `all`, both are replaced.
+        let out = store
+            .edit_file(
+                &s.id,
+                Utf8Path::new("dup.txt"),
+                FileEdit::SearchReplace(vec![Replacement {
+                    search: "x".into(),
+                    replace: "y".into(),
+                    all: true,
+                }]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.applied, 2);
+        let view = store.view(&s.id).await.unwrap();
+        assert_eq!(view.read(Utf8Path::new("dup.txt")).unwrap(), b"y\ny\n");
+    }
+
+    #[tokio::test]
+    async fn edit_new_file_via_empty_search() {
+        let fx = fixture();
+        let (store, s) = store_with_session(&fx).await;
+        let out = store
+            .edit_file(
+                &s.id,
+                Utf8Path::new("created.txt"),
+                FileEdit::SearchReplace(vec![Replacement {
+                    search: String::new(),
+                    replace: "hello\n".into(),
+                    all: false,
+                }]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.change, ChangeKind::Added);
+        let view = store.view(&s.id).await.unwrap();
+        assert_eq!(view.read(Utf8Path::new("created.txt")).unwrap(), b"hello\n");
+    }
+
+    #[tokio::test]
+    async fn edit_non_utf8_is_invalid() {
+        let fx = fixture();
+        let (store, s) = store_with_session(&fx).await;
+        store
+            .write_file(&s.id, Utf8Path::new("bin.dat"), &[0xff, 0xfe, 0x00])
+            .await
+            .unwrap();
+        let err = store
+            .edit_file(
+                &s.id,
+                Utf8Path::new("bin.dat"),
+                FileEdit::SearchReplace(vec![Replacement {
+                    search: "x".into(),
+                    replace: "y".into(),
+                    all: false,
+                }]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidInput(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edit_is_atomic_under_lock() {
+        // Two concurrent edits both consume the unique "base-a"; the shared
+        // write lock must serialize them so exactly one wins (the other sees the
+        // already-replaced content and Conflicts). Without the lock the
+        // read-modify-write races and both could "succeed".
+        let fx = fixture();
+        let (store, s) = store_with_session(&fx).await;
+        let store = std::sync::Arc::new(store);
+
+        let (sa, ida) = (store.clone(), s.id.clone());
+        let (sb, idb) = (store.clone(), s.id.clone());
+        let ha = tokio::spawn(async move {
+            sa.edit_file(
+                &ida,
+                Utf8Path::new("src/a.rs"),
+                FileEdit::SearchReplace(vec![Replacement {
+                    search: "base-a".into(),
+                    replace: "AAA".into(),
+                    all: false,
+                }]),
+            )
+            .await
+        });
+        let hb = tokio::spawn(async move {
+            sb.edit_file(
+                &idb,
+                Utf8Path::new("src/a.rs"),
+                FileEdit::SearchReplace(vec![Replacement {
+                    search: "base-a".into(),
+                    replace: "BBB".into(),
+                    all: false,
+                }]),
+            )
+            .await
+        });
+        let ra = ha.await.unwrap();
+        let rb = hb.await.unwrap();
+
+        let oks = [ra.is_ok(), rb.is_ok()].into_iter().filter(|x| *x).count();
+        assert_eq!(oks, 1, "exactly one concurrent edit should win");
+        let view = store.view(&s.id).await.unwrap();
+        let content = view.read(Utf8Path::new("src/a.rs")).unwrap();
+        assert!(
+            content == b"AAA\n" || content == b"BBB\n",
+            "got {:?}",
+            String::from_utf8_lossy(&content)
+        );
     }
 
     #[tokio::test]

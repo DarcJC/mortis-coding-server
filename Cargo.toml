@@ -17,6 +17,7 @@ mortis-vcs = { path = "crates/mortis-vcs" }
 mortis-embed = { path = "crates/mortis-embed" }
 mortis-search = { path = "crates/mortis-search" }
 mortis-session = { path = "crates/mortis-session" }
+mortis-asm = { path = "crates/mortis-asm" }
 mortis-app = { path = "crates/mortis-app" }
 
 # ---- async / runtime ----
@@ -46,7 +47,20 @@ globset = "0.4"
 
 # ---- diffing / embedded storage ----
 similar = "3"
+diffy = "0.4"
 redb = "4"
+
+# ---- binary analysis (assembly query sessions) ----
+# `object` parses PE/ELF/Mach-O (incl. fat) headers/sections/symbols.
+# `capstone` is the in-process multi-arch disassembler (bundled C library;
+# the build already needs a C compiler for rustls/aws-lc-rs).
+# `reqwest` is promoted from a transitive (gix) dep to a direct one for the
+# async binary download; default-features off keeps native-tls/OpenSSL out and
+# unifies with gix's rustls build (same locked 0.13.x).
+object = "0.36"
+capstone = "0.12"
+url = "2"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 
 # ---- serde / config ----
 serde = { version = "1", features = ["derive"] }

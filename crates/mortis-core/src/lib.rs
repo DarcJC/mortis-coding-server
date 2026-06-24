@@ -13,6 +13,7 @@
 //! - [`view::FileView`] — the seam that lets search/read work on either a bare
 //!   repo or a session overlay.
 
+pub mod asm;
 pub mod config;
 pub mod error;
 pub mod model;
@@ -24,13 +25,19 @@ pub mod view;
 pub use error::{CoreError, Result};
 
 // Re-export the most-used types at the crate root for ergonomic imports.
+pub use asm::{
+    AsmDownloadPolicy, AsmSession, AsmSessionId, AsmStatus, AssemblyStore, BinaryFormat, BinaryInfo,
+    BinaryOs, Disassembly, FunctionResolution, Instruction, SectionInfo, SegmentInfo,
+};
 pub use config::{RepoConfig, VcsKind};
 pub use model::{
     FileContent, Principal, ReadRange, RepoId, Rev, SessionId, Timestamp, ensure_safe_relative,
     line_range, slice_file_content,
 };
 pub use search::{CaseMode, Flow, SearchEngine, SearchMatch, SearchQuery};
-pub use session::{ChangeKind, FileStatus, Session, SessionStore};
+pub use session::{
+    ChangeKind, EditOutcome, FileEdit, FileStatus, Replacement, Session, SessionStore,
+};
 pub use vcs::{BlameLine, Commit, LogQuery, RepoContext, RepoSnapshot, VcsBackend};
 pub use view::FileView;
 

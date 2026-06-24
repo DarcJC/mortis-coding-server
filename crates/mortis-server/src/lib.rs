@@ -20,6 +20,7 @@ use std::sync::Arc;
 use axum::{Router, middleware::from_fn_with_state, routing::get};
 
 use mortis_app::{BackendSet, RepoRegistry, Services};
+use mortis_asm::MemAssemblyStore;
 use mortis_search::GrepSearchEngine;
 use mortis_session::DiskSessionStore;
 use mortis_vcs::GixBackend;
@@ -60,7 +61,16 @@ pub fn build_services(config: Config) -> anyhow::Result<(AppState, Arc<Services>
     let registry = Arc::new(RepoRegistry::build(config.repos, &data_dir, &backends)?);
     let search = Arc::new(GrepSearchEngine::new());
     let sessions = Arc::new(DiskSessionStore::new(sessions_dir)?);
-    let services = Arc::new(Services::new(registry, search, sessions));
+
+    // Assembly-query sessions: downloaded binaries live under `<data>/asm`.
+    let asm_dir = config
+        .asm
+        .download_dir
+        .clone()
+        .unwrap_or_else(|| data_dir.join("asm"));
+    let asm = Arc::new(MemAssemblyStore::new(asm_dir, config.asm.policy())?);
+
+    let services = Arc::new(Services::new(registry, search, sessions, asm));
 
     let auth = Arc::new(Authenticator::new(&config.auth.tokens));
     let state = AppState {
@@ -88,6 +98,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let bind = config.server.bind.clone();
     let ttl = config.session.ttl_duration();
     let reap = config.session.reap_duration();
+    let asm_ttl = config.asm.ttl_duration();
 
     let (state, services) = build_services(config)?;
     if state.auth.is_empty() {
@@ -106,7 +117,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         });
     }
 
-    let _scheduler = scheduler::start(services.clone(), ttl, reap)
+    let _scheduler = scheduler::start(services.clone(), ttl, reap, asm_ttl)
         .await
         .context("starting scheduler")?;
 

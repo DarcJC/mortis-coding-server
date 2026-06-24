@@ -23,6 +23,20 @@ tokens = [
 ttl = "24h"
 reap_interval = "10m"
 
+[asm]
+# Assembly-query sessions: download a binary from a URL and disassemble it.
+# allowed_hosts is DENY-BY-DEFAULT — with the empty list below, every download
+# is rejected. List the hosts you trust as download sources to enable the
+# feature. An entry is an exact host ("example.com") or a leading-dot domain
+# wildcard (".example.com" also matches subdomains).
+allowed_hosts = []
+# allowed_hosts = ["files.internal.example.com", ".cdn.example.org"]
+max_download_bytes = 268435456   # 256 MiB
+download_timeout = "60s"
+session_ttl = "1h"               # idle TTL; reaped on the [session] reap_interval
+max_sessions = 16
+# download_dir = "./data/asm"    # defaults to <data_dir>/asm
+
 # ---- repositories -----------------------------------------------------------
 # One [[repo]] table per repository to serve.
 

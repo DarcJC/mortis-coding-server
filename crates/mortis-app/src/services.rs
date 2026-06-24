@@ -20,9 +20,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::Serialize;
 
 use mortis_core::{
-    BlameLine, Commit, CoreError, FileContent, LogQuery, Principal, ReadRange, RepoId, RepoSnapshot,
-    Result, Rev, SearchEngine, SearchMatch, SearchQuery, Session, SessionId, SessionStore,
-    Timestamp, VcsKind, ensure_safe_relative, slice_file_content,
+    AsmSession, AsmSessionId, AssemblyStore, BinaryInfo, BlameLine, Commit, CoreError, Disassembly,
+    FileContent, FunctionResolution, LogQuery, Principal, ReadRange, RepoId, RepoSnapshot, Result,
+    Rev, SearchEngine, SearchMatch, SearchQuery, Session, SessionId, SessionStore, Timestamp,
+    VcsKind, ensure_safe_relative, slice_file_content,
 };
 use mortis_fs::PhysicalFileView;
 
@@ -48,6 +49,7 @@ pub struct Services {
     repos: Arc<RepoRegistry>,
     search: Arc<dyn SearchEngine>,
     sessions: Arc<dyn SessionStore>,
+    asm: Arc<dyn AssemblyStore>,
 }
 
 impl Services {
@@ -55,8 +57,9 @@ impl Services {
         repos: Arc<RepoRegistry>,
         search: Arc<dyn SearchEngine>,
         sessions: Arc<dyn SessionStore>,
+        asm: Arc<dyn AssemblyStore>,
     ) -> Self {
-        Self { repos, search, sessions }
+        Self { repos, search, sessions, asm }
     }
 
     /// Access the underlying registry (used by the scheduler).
@@ -286,6 +289,20 @@ impl Services {
         self.sessions.write_file(id, path, content).await
     }
 
+    /// Apply an in-place edit (unified diff or search/replace blocks) to a
+    /// session file. Owner-checked; the store performs the read-modify-write
+    /// atomically, so this facade does not pre-read the file.
+    pub async fn edit_file(
+        &self,
+        principal: &Principal,
+        id: &SessionId,
+        path: &Utf8Path,
+        edit: mortis_core::FileEdit,
+    ) -> Result<mortis_core::EditOutcome> {
+        self.authorize(principal, id).await?;
+        self.sessions.edit_file(id, path, edit).await
+    }
+
     /// Delete a file in the session view (whiteout if present in the base).
     pub async fn delete_file(
         &self,
@@ -329,6 +346,80 @@ impl Services {
         self.sessions.reap_expired(ttl).await
     }
 
+    // ------------------------------------------------------- assembly sessions
+
+    /// Create an assembly session: download `url` and validate it in the
+    /// background. Returns immediately with the session in a downloading state.
+    pub async fn create_asm_session(
+        &self,
+        principal: &Principal,
+        url: &str,
+    ) -> Result<AsmSession> {
+        self.asm.create(principal, url).await
+    }
+
+    /// List the caller's assembly sessions.
+    pub async fn list_asm_sessions(&self, principal: &Principal) -> Result<Vec<AsmSession>> {
+        self.asm.list(principal).await
+    }
+
+    /// Fetch one of the caller's assembly sessions (status, progress, result).
+    pub async fn get_asm_session(
+        &self,
+        principal: &Principal,
+        id: &AsmSessionId,
+    ) -> Result<AsmSession> {
+        self.authorize_asm(principal, id).await
+    }
+
+    /// Delete one of the caller's assembly sessions.
+    pub async fn delete_asm_session(
+        &self,
+        principal: &Principal,
+        id: &AsmSessionId,
+    ) -> Result<()> {
+        self.authorize_asm(principal, id).await?;
+        self.asm.delete(id).await
+    }
+
+    /// Disassemble an address range in the caller's assembly session.
+    pub async fn asm_disassemble(
+        &self,
+        principal: &Principal,
+        id: &AsmSessionId,
+        start: u64,
+        len: u64,
+    ) -> Result<Disassembly> {
+        self.authorize_asm(principal, id).await?;
+        self.asm.disassemble(id, start, len).await
+    }
+
+    /// Resolve an address to a function name in the caller's assembly session.
+    pub async fn asm_resolve_function(
+        &self,
+        principal: &Principal,
+        id: &AsmSessionId,
+        address: u64,
+    ) -> Result<FunctionResolution> {
+        self.authorize_asm(principal, id).await?;
+        self.asm.resolve_function(id, address).await
+    }
+
+    /// Header/section metadata of the caller's assembly-session binary.
+    pub async fn asm_metadata(
+        &self,
+        principal: &Principal,
+        id: &AsmSessionId,
+    ) -> Result<BinaryInfo> {
+        self.authorize_asm(principal, id).await?;
+        self.asm.metadata(id).await
+    }
+
+    /// Reap idle assembly sessions (called by the background reaper).
+    pub async fn reap_asm_sessions(&self, ttl: std::time::Duration) -> Result<usize> {
+        self.asm.reap_expired(ttl).await
+    }
+
     // ----------------------------------------------------------------- guts
 
     /// Load a session and verify the caller owns it.
@@ -340,6 +431,18 @@ impl Services {
             )));
         }
         self.sessions.touch(id).await.ok();
+        Ok(s)
+    }
+
+    /// Load an assembly session and verify the caller owns it.
+    async fn authorize_asm(&self, principal: &Principal, id: &AsmSessionId) -> Result<AsmSession> {
+        let s = self.asm.get(id).await?;
+        if &s.owner != principal {
+            return Err(CoreError::Forbidden(format!(
+                "assembly session {id} is not owned by {principal}"
+            )));
+        }
+        self.asm.touch(id).await.ok();
         Ok(s)
     }
 }

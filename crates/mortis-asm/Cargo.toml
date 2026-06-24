@@ -1,0 +1,28 @@
+[package]
+name = "mortis-asm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Assembly-query sessions: download a binary, validate it, disassemble and inspect it."
+
+[dependencies]
+mortis-core = { workspace = true }
+camino = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+object = { workspace = true }
+capstone = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+axum = { workspace = true }
+# `write` lets tests synthesize valid ELF/Mach-O fixtures instead of committing
+# binary blobs.
+object = { workspace = true, features = ["write"] }

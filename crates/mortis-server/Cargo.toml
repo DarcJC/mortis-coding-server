@@ -17,6 +17,7 @@ mortis-app = { workspace = true }
 mortis-vcs = { workspace = true }
 mortis-search = { workspace = true }
 mortis-session = { workspace = true }
+mortis-asm = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
@@ -39,3 +40,5 @@ futures = { workspace = true }
 tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 mortis-core = { workspace = true }
+# Synthesize a valid ELF fixture for the assembly-session e2e test.
+object = { workspace = true, features = ["write"] }

@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use mortis_app::Services;
 use mortis_core::{
-    CaseMode, LogQuery, Principal, RepoId, Rev, SearchQuery, SessionId, line_range,
+    AsmSessionId, CaseMode, LogQuery, Principal, RepoId, Rev, SearchQuery, SessionId, line_range,
 };
 
 use crate::error::to_mcp_error;
@@ -155,6 +155,18 @@ struct WriteArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct EditArgs {
+    session_id: String,
+    path: String,
+    /// A strict unified/git diff to apply (provide this OR `edits`, not both).
+    #[serde(default)]
+    diff: Option<String>,
+    /// Literal search/replace blocks to apply (provide this OR `diff`).
+    #[serde(default)]
+    edits: Option<Vec<mortis_core::Replacement>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct SessionPathArg {
     session_id: String,
     path: String,
@@ -165,6 +177,33 @@ struct DiffArgs {
     session_id: String,
     #[serde(default)]
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AsmCreateArgs {
+    /// URL of the binary to download (http/https; host must be allowlisted).
+    url: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AsmSessionArg {
+    asm_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AsmDisasmArgs {
+    asm_id: String,
+    /// Start virtual address (decimal, or a `0x`-prefixed hex string).
+    start: String,
+    /// Number of bytes to disassemble.
+    len: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AsmFnArgs {
+    asm_id: String,
+    /// Virtual address to resolve (decimal, or a `0x`-prefixed hex string).
+    address: String,
 }
 
 // ----------------------------------------------------------------- the tools --
@@ -290,6 +329,33 @@ impl McpServer {
         ok_json(serde_json::json!({ "written": a.path, "bytes": a.content.len() }))
     }
 
+    #[tool(
+        description = "Edit a file in a session via a strict unified diff OR literal search/replace blocks (provide exactly one of `diff`/`edits`). Fails if the diff does not apply cleanly or a search is not uniquely found."
+    )]
+    async fn edit_file(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<EditArgs>,
+    ) -> Result<String, ErrorData> {
+        let principal = principal_of(&parts)?;
+        let edit = match (a.diff, a.edits) {
+            (Some(d), None) => mortis_core::FileEdit::UnifiedDiff(d),
+            (None, Some(e)) => mortis_core::FileEdit::SearchReplace(e),
+            _ => {
+                return Err(ErrorData::invalid_params(
+                    "provide exactly one of `diff` or `edits`",
+                    None,
+                ));
+            }
+        };
+        let outcome = self
+            .services
+            .edit_file(&principal, &SessionId::from(a.session_id.as_str()), Utf8Path::new(&a.path), edit)
+            .await
+            .map_err(to_mcp_error)?;
+        ok_json(outcome)
+    }
+
     #[tool(description = "Delete a file in a session view (whiteout if it exists in the base).")]
     async fn delete_file(
         &self,
@@ -337,6 +403,96 @@ impl McpServer {
         let patch = self.services.export_patch(&principal, &SessionId::from(a.session_id.as_str())).await.map_err(to_mcp_error)?;
         ok_json(serde_json::json!({ "patch": patch }))
     }
+
+    #[tool(
+        description = "Create an assembly-query session: download a binary from a URL (http/https, host must be allowlisted) and validate it in the background. Poll get_asm_session for status/progress."
+    )]
+    async fn create_asm_session(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<AsmCreateArgs>,
+    ) -> Result<String, ErrorData> {
+        let principal = principal_of(&parts)?;
+        let s = self.services.create_asm_session(&principal, &a.url).await.map_err(to_mcp_error)?;
+        ok_json(s)
+    }
+
+    #[tool(description = "List the caller's assembly-query sessions.")]
+    async fn list_asm_sessions(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<String, ErrorData> {
+        let principal = principal_of(&parts)?;
+        let list = self.services.list_asm_sessions(&principal).await.map_err(to_mcp_error)?;
+        ok_json(list)
+    }
+
+    #[tool(
+        description = "Get an assembly session's status: download progress, the validated binary's OS/format/arch metadata when ready, or the failure reason."
+    )]
+    async fn get_asm_session(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<AsmSessionArg>,
+    ) -> Result<String, ErrorData> {
+        let principal = principal_of(&parts)?;
+        let s = self.services.get_asm_session(&principal, &AsmSessionId::from(a.asm_id.as_str())).await.map_err(to_mcp_error)?;
+        ok_json(s)
+    }
+
+    #[tool(description = "Delete one of the caller's assembly sessions and its downloaded binary.")]
+    async fn delete_asm_session(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<AsmSessionArg>,
+    ) -> Result<String, ErrorData> {
+        let principal = principal_of(&parts)?;
+        self.services.delete_asm_session(&principal, &AsmSessionId::from(a.asm_id.as_str())).await.map_err(to_mcp_error)?;
+        ok_json(serde_json::json!({ "deleted": a.asm_id }))
+    }
+
+    #[tool(description = "Disassemble a virtual-address range of a ready assembly-session binary.")]
+    async fn asm_disassemble(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<AsmDisasmArgs>,
+    ) -> Result<String, ErrorData> {
+        let principal = principal_of(&parts)?;
+        let start = parse_u64_arg(&a.start)?;
+        let dis = self
+            .services
+            .asm_disassemble(&principal, &AsmSessionId::from(a.asm_id.as_str()), start, a.len)
+            .await
+            .map_err(to_mcp_error)?;
+        ok_json(dis)
+    }
+
+    #[tool(description = "Resolve a virtual address to a function name in a ready assembly-session binary.")]
+    async fn asm_resolve_function(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<AsmFnArgs>,
+    ) -> Result<String, ErrorData> {
+        let principal = principal_of(&parts)?;
+        let address = parse_u64_arg(&a.address)?;
+        let r = self
+            .services
+            .asm_resolve_function(&principal, &AsmSessionId::from(a.asm_id.as_str()), address)
+            .await
+            .map_err(to_mcp_error)?;
+        ok_json(r)
+    }
+
+    #[tool(description = "Read header/section metadata of a ready assembly-session binary.")]
+    async fn asm_metadata(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<AsmSessionArg>,
+    ) -> Result<String, ErrorData> {
+        let principal = principal_of(&parts)?;
+        let meta = self.services.asm_metadata(&principal, &AsmSessionId::from(a.asm_id.as_str())).await.map_err(to_mcp_error)?;
+        ok_json(meta)
+    }
 }
 
 #[tool_handler]
@@ -349,8 +505,10 @@ impl ServerHandler for McpServer {
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
         info.instructions = Some(
             "mortis-code-server: search, read, blame, and history over Git/SVN repos, \
-             plus copy-on-write sessions for edits (status/diff/patch). All tools require \
-             a bearer token; session tools are scoped to the caller."
+             plus copy-on-write sessions for edits (write_file/edit_file via diff or \
+             search/replace, status/diff/patch), and assembly-query sessions that download \
+             a binary and disassemble it / resolve addresses / read metadata. All tools \
+             require a bearer token; session tools are scoped to the caller."
                 .to_string(),
         );
         info
@@ -376,6 +534,17 @@ fn principal_of(parts: &Parts) -> Result<Principal, ErrorData> {
 fn ok_json<T: serde::Serialize>(value: T) -> Result<String, ErrorData> {
     serde_json::to_string(&value)
         .map_err(|e| ErrorData::internal_error(format!("serialization failed: {e}"), None))
+}
+
+/// Parse a `u64` tool argument from a decimal or `0x`-prefixed hex string.
+fn parse_u64_arg(s: &str) -> Result<u64, ErrorData> {
+    let t = s.trim();
+    let parsed = if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16)
+    } else {
+        t.parse::<u64>()
+    };
+    parsed.map_err(|_| ErrorData::invalid_params(format!("invalid number: {s:?}"), None))
 }
 
 fn case_mode(s: Option<&str>) -> CaseMode {

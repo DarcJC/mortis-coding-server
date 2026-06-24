@@ -15,10 +15,14 @@ use mortis_core::RepoId;
 
 /// Build and start the scheduler. The returned [`JobScheduler`] must be kept
 /// alive for jobs to keep firing.
+///
+/// The CoW-session reaper and the assembly-session reaper share `reap_interval`
+/// (their TTLs differ): one cadence keeps the configuration small.
 pub async fn start(
     services: Arc<Services>,
     reap_ttl: Duration,
     reap_interval: Duration,
+    asm_ttl: Duration,
 ) -> anyhow::Result<JobScheduler> {
     let sched = JobScheduler::new().await?;
 
@@ -46,6 +50,19 @@ pub async fn start(
         })
     })?;
     sched.add(reaper).await?;
+
+    let svc = services.clone();
+    let asm_reaper = Job::new_repeated_async(reap_interval, move |_uuid, _lock| {
+        let svc = svc.clone();
+        Box::pin(async move {
+            match svc.reap_asm_sessions(asm_ttl).await {
+                Ok(n) if n > 0 => info!("reaped {n} expired assembly session(s)"),
+                Ok(_) => {}
+                Err(e) => warn!("assembly session reap failed: {e}"),
+            }
+        })
+    })?;
+    sched.add(asm_reaper).await?;
 
     sched.start().await?;
     Ok(sched)

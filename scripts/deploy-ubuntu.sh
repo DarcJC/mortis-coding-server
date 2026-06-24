@@ -441,6 +441,13 @@ tokens = [
   { token = "$tok", principal = "$prin" },
 ]
 
+[asm]                          # 汇编查询会话（二进制下载 + 反汇编）
+allowed_hosts = []             # 下载主机白名单；默认拒绝（空 = 全部拒绝）
+max_download_bytes = 2684354560 # 单次下载上限（2560 MiB）
+download_timeout = "60s"       # 单次下载超时
+session_ttl = "1h"             # 汇编会话空闲存活时间（按 reap_interval 回收）
+max_sessions = 16              # 并发汇编会话上限
+
 [session]
 ttl = "24h"
 reap_interval = "10m"

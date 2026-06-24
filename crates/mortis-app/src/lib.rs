@@ -20,7 +20,8 @@ mod tests {
 
     use mortis_core::vcs::RepoContext;
     use mortis_core::{
-        BlameLine, Commit, CoreError, FileContent, FileView, LogQuery, Principal, ReadRange,
+        AsmSession, AsmSessionId, AssemblyStore, BinaryInfo, BlameLine, Commit, CoreError,
+        Disassembly, FileContent, FileView, FunctionResolution, LogQuery, Principal, ReadRange,
         RepoConfig, RepoId, RepoSnapshot, Result, Rev, SearchEngine, SearchMatch, SearchQuery,
         Session, SessionId, SessionStore, Timestamp, VcsBackend, VcsKind, slice_file_content,
     };
@@ -120,6 +121,14 @@ mod tests {
         async fn write_file(&self, _id: &SessionId, _p: &Utf8Path, _c: &[u8]) -> Result<()> {
             Ok(())
         }
+        async fn edit_file(
+            &self,
+            id: &SessionId,
+            _p: &Utf8Path,
+            _e: mortis_core::FileEdit,
+        ) -> Result<mortis_core::EditOutcome> {
+            Err(CoreError::not_found(id.0.clone()))
+        }
         async fn delete_file(&self, _id: &SessionId, _p: &Utf8Path) -> Result<()> {
             Ok(())
         }
@@ -146,6 +155,42 @@ mod tests {
         }
     }
 
+    struct NoAsm;
+    #[async_trait]
+    impl AssemblyStore for NoAsm {
+        async fn create(&self, _o: &Principal, _u: &str) -> Result<AsmSession> {
+            Err(CoreError::Other("no asm store".into()))
+        }
+        async fn get(&self, id: &AsmSessionId) -> Result<AsmSession> {
+            Err(CoreError::not_found(id.0.clone()))
+        }
+        async fn list(&self, _o: &Principal) -> Result<Vec<AsmSession>> {
+            Ok(vec![])
+        }
+        async fn delete(&self, id: &AsmSessionId) -> Result<()> {
+            Err(CoreError::not_found(id.0.clone()))
+        }
+        async fn disassemble(&self, id: &AsmSessionId, _s: u64, _l: u64) -> Result<Disassembly> {
+            Err(CoreError::not_found(id.0.clone()))
+        }
+        async fn resolve_function(
+            &self,
+            id: &AsmSessionId,
+            _a: u64,
+        ) -> Result<FunctionResolution> {
+            Err(CoreError::not_found(id.0.clone()))
+        }
+        async fn metadata(&self, id: &AsmSessionId) -> Result<BinaryInfo> {
+            Err(CoreError::not_found(id.0.clone()))
+        }
+        async fn touch(&self, _id: &AsmSessionId) -> Result<()> {
+            Ok(())
+        }
+        async fn reap_expired(&self, _ttl: std::time::Duration) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
     fn spec(id: &str, kind: VcsKind) -> RepoConfig {
         RepoConfig {
             id: RepoId::from(id),
@@ -163,7 +208,12 @@ mod tests {
     fn services_over(tmp: &Utf8Path, repos: Vec<RepoConfig>) -> Services {
         let backends = BackendSet { git: Arc::new(FakeGit), svn: None };
         let reg = Arc::new(RepoRegistry::build(repos, tmp, &backends).unwrap());
-        Services::new(reg, Arc::new(NoSearch), Arc::new(NoSessions::default()))
+        Services::new(
+            reg,
+            Arc::new(NoSearch),
+            Arc::new(NoSessions::default()),
+            Arc::new(NoAsm),
+        )
     }
 
     #[tokio::test]
@@ -266,7 +316,7 @@ mod tests {
         };
         let reg = Arc::new(RepoRegistry::build(vec![spec("r1", VcsKind::Git)], &root, &backends).unwrap());
         let sessions = Arc::new(NoSessions::default());
-        let svc = Services::new(reg, Arc::new(NoSearch), sessions.clone());
+        let svc = Services::new(reg, Arc::new(NoSearch), sessions.clone(), Arc::new(NoAsm));
 
         // sync #1 -> snapshots/rev1 (current). Pretend a live session pins it.
         let snap1 = svc.sync_repo(&RepoId::from("r1")).await.unwrap();
