@@ -9,7 +9,8 @@
 #      lldb、llvm、binutils(汇编/二进制调试工具链，为后续命令执行沙箱预装)。
 #   3. 始终从源码 `cargo build --release` 构建（缺 cargo 自动装 rustup；REPO_ROOT
 #      不是 git 仓库时，自动从 --repo-url 克隆源码后再编译）。
-#   4. 创建专用系统用户 mortis 与 FHS 目录布局，安装二进制 + 生成 config.toml。
+#   4. 创建专用系统用户 mortis 与 FHS 目录布局，安装二进制（setcap 授予绑定
+#      <1024 特权端口能力，使非 root 的 mortis 可监听 80/443）+ 生成 config.toml。
 #   5. 用 pip+venv 安装 supervisor（规避 PEP 668），写好 supervisord/程序配置。
 #   6. 配置开机自启：systemd → cron @reboot → 手动 三级回退（兼容无 systemd）。
 #
@@ -160,10 +161,12 @@ install_system_deps() {
     python3 python3-venv \
     build-essential cmake pkg-config \
     curl git ca-certificates \
+    libcap2-bin \
     lldb llvm binutils
   # binutils → GNU objdump/readelf/nm/addr2line；llvm → llvm-objdump/llvm-readobj 等；
   # lldb → LLVM 调试器。供下一阶段的命令执行沙箱调试二进制汇编。
-  ok "系统依赖安装完成（含 subversion、lldb/llvm/binutils 汇编调试工具链）"
+  # libcap2-bin → 提供 setcap，用于授予二进制绑定 <1024 特权端口（如 80/443）的能力。
+  ok "系统依赖安装完成（含 subversion、libcap2-bin、lldb/llvm/binutils 汇编调试工具链）"
 }
 
 # ---- 以构建用户身份执行命令（保持 target/ 归属正常） ------------------------
@@ -270,6 +273,26 @@ install_binary() {
   install -m 0755 "$REPO_ROOT/target/release/mortis-code-server" \
                   "$INSTALL_DIR/bin/mortis-code-server"
   ok "已安装二进制到 $INSTALL_DIR/bin/mortis-code-server"
+}
+
+# ---- 授予绑定特权端口的能力（让非 root 的 mortis 也能监听 80/443 等 <1024 端口） ----
+# 服务以系统用户 "$SVC_USER" 运行，默认无权绑定 <1024 端口。setcap 把
+# CAP_NET_BIND_SERVICE 写入二进制文件的扩展属性，使其 exec 时即获得该能力。
+# 注意：install 复制会生成新 inode、清除扩展属性，故必须在 install_binary 之后、
+# 且每次重新部署都重新授予。
+grant_net_bind_capability() {
+  local bin="$INSTALL_DIR/bin/mortis-code-server"
+  if ! command -v setcap >/dev/null 2>&1; then
+    warn "未找到 setcap（请安装 libcap2-bin），无法授予绑定特权端口能力。"
+    [ "$PORT" -lt 1024 ] && die "端口 $PORT < 1024，非 root 用户 '$SVC_USER' 需要 setcap 才能绑定；请安装 libcap2-bin 后重试。"
+    return
+  fi
+  if setcap 'cap_net_bind_service=+ep' "$bin"; then
+    ok "已授予 cap_net_bind_service：'$SVC_USER' 运行的二进制可绑定 <1024 特权端口（如 80/443）"
+  else
+    warn "setcap 失败：$bin（文件系统可能不支持扩展属性，如部分容器/网络盘）。"
+    [ "$PORT" -lt 1024 ] && die "端口 $PORT < 1024 且 setcap 失败，服务将无法以非 root 用户绑定。"
+  fi
 }
 
 # ---- token 生成 -------------------------------------------------------------
@@ -559,6 +582,7 @@ main() {
   setup_user_and_dirs
   build_binary
   install_binary
+  grant_net_bind_capability
   write_config
   install_supervisor
   write_supervisor_conf
