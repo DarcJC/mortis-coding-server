@@ -1,0 +1,17 @@
+[package]
+name = "mortis-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Embeds and extracts platform svn binaries so the server is self-contained."
+
+[dependencies]
+mortis-core = { workspace = true }
+rust-embed = { workspace = true }
+directories = { workspace = true }
+camino = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

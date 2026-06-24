@@ -1,6 +1,77 @@
-[package]
-name = "mortis-code-server"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+repository = "https://github.com/example/mortis-code-server"
 
-[dependencies]
+[workspace.dependencies]
+# ---- internal crates ----
+mortis-core = { path = "crates/mortis-core" }
+mortis-fs = { path = "crates/mortis-fs" }
+mortis-vcs = { path = "crates/mortis-vcs" }
+mortis-embed = { path = "crates/mortis-embed" }
+mortis-search = { path = "crates/mortis-search" }
+mortis-session = { path = "crates/mortis-session" }
+mortis-app = { path = "crates/mortis-app" }
+
+# ---- async / runtime ----
+tokio = { version = "1.52", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+
+# ---- http server ----
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
+
+# ---- mcp (model context protocol) ----
+rmcp = { version = "1.8", features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = "1"
+
+# ---- git (pure rust, rustls transport, no C toolchain) ----
+gix = { version = "0.85", features = ["blocking-http-transport-reqwest-rust-tls"] }
+
+# ---- code search (embedded ripgrep crates) ----
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+ignore = "0.4"
+globset = "0.4"
+
+# ---- diffing / embedded storage ----
+similar = "3"
+redb = "4"
+
+# ---- serde / config ----
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# ---- errors / logging ----
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# ---- utils ----
+camino = { version = "1", features = ["serde1"] }
+directories = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+subtle = "2"
+quick-xml = { version = "0.40", features = ["serialize"] }
+zstd = "0.13"
+tokio-cron-scheduler = "0.15"
+rust-embed = "8"
+bytes = "1"
+humantime = "2"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

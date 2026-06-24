@@ -1,0 +1,16 @@
+[package]
+name = "mortis-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Domain contract (traits, types, errors) for mortis-code-server."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+camino = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }

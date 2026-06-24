@@ -1,0 +1,19 @@
+[package]
+name = "mortis-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Embedded ripgrep code-search engine operating over a FileView."
+
+[dependencies]
+mortis-core = { workspace = true }
+grep-searcher = { workspace = true }
+grep-regex = { workspace = true }
+grep-matcher = { workspace = true }
+globset = { workspace = true }
+camino = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+mortis-fs = { workspace = true }

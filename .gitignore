@@ -1,1 +1,15 @@
+# Rust build artifacts
 /target
+**/*.rs.bk
+
+# Runtime data (materialized repos, sessions, extracted binaries)
+/data
+
+# Vendored svn binaries are large and fetched on demand via scripts/fetch-svn.*
+# Keep the directory structure (placeholders) but not the binaries themselves.
+crates/mortis-embed/assets/svn/*/*
+!crates/mortis-embed/assets/svn/*/.gitkeep
+
+# Editor/OS noise
+.DS_Store
+*.swp

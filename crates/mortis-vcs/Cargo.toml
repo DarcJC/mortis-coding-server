@@ -1,0 +1,23 @@
+[package]
+name = "mortis-vcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Version-control backends: gix (Git) and embedded-svn-cli (SVN)."
+
+[dependencies]
+mortis-core = { workspace = true }
+mortis-embed = { workspace = true }
+gix = { workspace = true }
+camino = { workspace = true }
+globset = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+quick-xml = { workspace = true }
+serde = { workspace = true }
+humantime = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

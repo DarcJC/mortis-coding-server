@@ -1,0 +1,15 @@
+[package]
+name = "mortis-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Concrete FileView implementations: physical directory and CoW overlay."
+
+[dependencies]
+mortis-core = { workspace = true }
+camino = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
