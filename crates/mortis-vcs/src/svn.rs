@@ -4,7 +4,10 @@
 //! → system), so this backend is self-contained when binaries are vendored and
 //! falls back to a system `svn` otherwise. All read operations work directly
 //! against the repository URL (no persistent working copy); `sync` materializes
-//! the whitelisted tree with `svn export`.
+//! the whitelisted tree with `svn export` into an immutable, per-revision
+//! snapshot `<root>/snapshots/<revnum>` (published atomically; an existing
+//! snapshot for the revision is reused and the export skipped). A re-sync to a
+//! new revision publishes a new snapshot, so a live session's base is stable.
 
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -123,36 +126,38 @@ impl VcsBackend for SvnCliBackend {
         let head = String::from_utf8_lossy(&info).trim().to_string();
 
         // Export the tree (no .svn metadata) to a temp dir, then materialize the
-        // whitelisted subset into the read-only work dir.
+        // whitelisted subset into an immutable, per-revision snapshot. Skip the
+        // export entirely when this revision is already materialized.
         let export_dir = ctx.internal_dir().join("export");
-        if export_dir.exists() {
-            std::fs::remove_dir_all(&export_dir)?;
+        if !ctx.snapshot_dir(&head).exists() {
+            if export_dir.exists() {
+                std::fs::remove_dir_all(&export_dir)?;
+            }
+            if let Some(parent) = export_dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            self.run(
+                user,
+                pass,
+                &["export", "--force", &target(url, None, &rev), export_dir.as_str()],
+            )
+            .await?;
         }
-        if let Some(parent) = export_dir.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        self.run(
-            user,
-            pass,
-            &["export", "--force", &target(url, None, &rev), export_dir.as_str()],
-        )
-        .await?;
 
         let filter = GlobFilter::new(&ctx.spec.include, &ctx.spec.exclude)?;
-        let work = ctx.work_dir();
-        if work.exists() {
-            std::fs::remove_dir_all(&work)?;
-        }
-        std::fs::create_dir_all(&work)?;
-        let mut count = 0usize;
-        copy_filtered(&export_dir, &export_dir, &work, &filter, &mut count)?;
+        let (base_path, count) =
+            crate::publish::publish_snapshot(&ctx.snapshots_dir(), &head, |staging| {
+                let mut count = 0usize;
+                copy_filtered(&export_dir, &export_dir, staging, &filter, &mut count)?;
+                Ok(count)
+            })?;
         // The export is just a staging area; reclaim its space.
         std::fs::remove_dir_all(&export_dir).ok();
 
         Ok(RepoSnapshot {
             repo: ctx.spec.id.clone(),
             head,
-            base_path: work,
+            base_path,
             synced_at: Timestamp::now(),
             file_count: count,
         })

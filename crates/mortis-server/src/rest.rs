@@ -11,7 +11,7 @@ use camino::Utf8Path;
 use serde::Deserialize;
 
 use mortis_core::{
-    LogQuery, Principal, ReadRange, RepoId, Rev, SearchQuery, SessionId,
+    LogQuery, Principal, RepoId, Rev, SearchQuery, SessionId, line_range,
 };
 
 use crate::error::ApiResult;
@@ -62,16 +62,6 @@ struct ReadQuery {
     end: Option<u32>,
     #[serde(default)]
     rev: Option<String>,
-}
-
-fn line_range(start: Option<u32>, end: Option<u32>) -> Option<ReadRange> {
-    match (start, end) {
-        (None, None) => None,
-        _ => Some(ReadRange::Lines {
-            start: start.unwrap_or(1),
-            end,
-        }),
-    }
 }
 
 async fn read_repo_file(

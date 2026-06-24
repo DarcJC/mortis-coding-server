@@ -105,6 +105,7 @@ impl DiskSessionStore {
 
     /// Load a session record from disk, or [`CoreError::NotFound`] if absent.
     fn load_record(&self, id: &SessionId) -> Result<SessionRecord> {
+        validate_id(id)?;
         let path = self.meta_path(id);
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
@@ -135,39 +136,26 @@ impl DiskSessionStore {
 
 /// Reject paths that could escape the session's upper directory.
 ///
-/// We forbid absolute paths and any `..` / root / prefix components, then
-/// re-join the surviving normal components. The result is always a relative
-/// path that stays inside `upper/`.
+/// Thin wrapper over the shared [`mortis_core::ensure_safe_relative`] guard so
+/// session writes/deletes confine request paths exactly as the repo-read
+/// services do.
 fn sanitize(rel: &Utf8Path) -> Result<Utf8PathBuf> {
+    mortis_core::ensure_safe_relative(rel)
+}
+
+/// Reject a session id that is not a single safe path component.
+///
+/// Ids are otherwise concatenated straight into on-disk paths
+/// (`session_dir = root.join(id)`), so a crafted id like `../../other` would
+/// redirect `load_record`/`delete` (and its `remove_dir_all`) outside the
+/// sessions root. Legitimate ids are UUIDs — exactly one normal component.
+fn validate_id(id: &SessionId) -> Result<()> {
     use camino::Utf8Component;
-
-    if rel.as_str().is_empty() {
-        return Err(CoreError::invalid("empty path"));
+    let mut comps = Utf8Path::new(&id.0).components();
+    match (comps.next(), comps.next()) {
+        (Some(Utf8Component::Normal(_)), None) => Ok(()),
+        _ => Err(CoreError::invalid(format!("invalid session id: {:?}", id.0))),
     }
-
-    let mut out = Utf8PathBuf::new();
-    for comp in rel.components() {
-        match comp {
-            Utf8Component::Normal(part) => out.push(part),
-            // Reject anything that could walk out of, or anchor outside, upper/.
-            Utf8Component::ParentDir
-            | Utf8Component::RootDir
-            | Utf8Component::Prefix(_) => {
-                return Err(CoreError::invalid(format!(
-                    "path escapes session root: {rel}"
-                )));
-            }
-            // `.` is harmless; drop it.
-            Utf8Component::CurDir => {}
-        }
-    }
-
-    if out.as_str().is_empty() {
-        return Err(CoreError::invalid(format!("path resolves to root: {rel}")));
-    }
-    // Normalize to forward slashes so logical paths match `mortis-fs` output
-    // (which also normalizes) on every platform.
-    Ok(Utf8PathBuf::from(out.as_str().replace('\\', "/")))
 }
 
 /// Recursively collect base-relative file paths under an upper directory.
@@ -344,6 +332,7 @@ impl SessionStore for DiskSessionStore {
     }
 
     async fn delete(&self, id: &SessionId) -> Result<()> {
+        validate_id(id)?;
         let _guard = self.write_lock.lock().await;
         let dir = self.session_dir(id);
         match std::fs::remove_dir_all(&dir) {
@@ -508,6 +497,33 @@ impl SessionStore for DiskSessionStore {
             }
         }
         Ok(reaped)
+    }
+
+    async fn referenced_bases(&self) -> Result<HashSet<Utf8PathBuf>> {
+        // Hold the write lock so the scan is atomic against create/delete/reap
+        // (all of which also take it); a snapshot GC built on this set then
+        // cannot race a concurrent session creation that pins a base.
+        let _guard = self.write_lock.lock().await;
+
+        let mut bases = HashSet::new();
+        let dir = match std::fs::read_dir(&self.root) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(bases),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in dir {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // Tolerate stray/incomplete directories, like `list`/`reap_expired`.
+            if let Ok(rec) = self.load_record(&SessionId(name.to_owned())) {
+                bases.insert(rec.session.base_path);
+            }
+        }
+        Ok(bases)
     }
 
     async fn view(&self, id: &SessionId) -> Result<Box<dyn FileView>> {
@@ -877,6 +893,38 @@ mod tests {
         let reaped = store.reap_expired(Duration::from_secs(3600)).await.unwrap();
         assert_eq!(reaped, 0);
         assert!(store.get(&s.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn referenced_bases_tracks_live_sessions() {
+        let fx = fixture();
+        let (store, s) = store_with_session(&fx).await;
+
+        // The one live session pins exactly its base path.
+        let bases = store.referenced_bases().await.unwrap();
+        assert_eq!(bases.len(), 1);
+        assert!(bases.contains(&fx.base));
+
+        // Once deleted, nothing references the base anymore.
+        store.delete(&s.id).await.unwrap();
+        assert!(store.referenced_bases().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn traversal_session_id_is_rejected() {
+        let fx = fixture();
+        let store = DiskSessionStore::new(fx.root.clone()).unwrap();
+        for bad in ["../escape", "../../etc", "a/b", "..", ""] {
+            let id = SessionId(bad.to_string());
+            assert!(
+                matches!(store.get(&id).await, Err(CoreError::InvalidInput(_))),
+                "get({bad:?}) should be rejected as invalid"
+            );
+            assert!(
+                matches!(store.delete(&id).await, Err(CoreError::InvalidInput(_))),
+                "delete({bad:?}) should be rejected as invalid"
+            );
+        }
     }
 
     #[tokio::test]

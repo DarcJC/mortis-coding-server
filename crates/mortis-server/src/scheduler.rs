@@ -41,6 +41,8 @@ pub async fn start(
                 Ok(_) => {}
                 Err(e) => warn!("session reap failed: {e}"),
             }
+            // Reaping may have freed sessions; reclaim now-unreferenced snapshots.
+            svc.gc_all_snapshots().await;
         })
     })?;
     sched.add(reaper).await?;

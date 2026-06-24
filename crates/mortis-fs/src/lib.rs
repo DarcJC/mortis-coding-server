@@ -24,6 +24,21 @@ fn is_vcs_path(path: &Utf8Path) -> bool {
         .any(|c| VCS_DIRS.contains(&c.as_str()))
 }
 
+/// Whether a logical path would escape its root: any absolute, drive-prefix, or
+/// `..` component. Such paths must never resolve to an on-disk file — otherwise
+/// a request like `../../etc/passwd` would read outside the view. (Cheap and
+/// allocation-free; the canonical normalizing form is
+/// [`mortis_core::ensure_safe_relative`].)
+fn escapes_root(path: &Utf8Path) -> bool {
+    use camino::Utf8Component;
+    path.components().any(|c| {
+        matches!(
+            c,
+            Utf8Component::ParentDir | Utf8Component::RootDir | Utf8Component::Prefix(_)
+        )
+    })
+}
+
 /// Normalize a path to forward-slash form so logical paths are identical on
 /// every platform (camino keeps the OS separator, which would otherwise leak
 /// `\` into API responses on Windows).
@@ -100,7 +115,7 @@ impl FileView for PhysicalFileView {
     }
 
     fn resolve(&self, logical: &Utf8Path) -> Result<Option<Utf8PathBuf>> {
-        if is_vcs_path(logical) {
+        if is_vcs_path(logical) || escapes_root(logical) {
             return Ok(None);
         }
         let p = self.root.join(logical);
@@ -167,7 +182,7 @@ impl FileView for OverlayFileView {
     }
 
     fn resolve(&self, logical: &Utf8Path) -> Result<Option<Utf8PathBuf>> {
-        if is_vcs_path(logical) || self.is_deleted(logical) {
+        if is_vcs_path(logical) || escapes_root(logical) || self.is_deleted(logical) {
             return Ok(None);
         }
         let up = self.upper.join(logical);
@@ -256,5 +271,35 @@ mod tests {
         assert!(view.read(Utf8Path::new("gone.txt")).is_err());
         // keep.txt served from base
         assert_eq!(view.read(Utf8Path::new("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn path_traversal_does_not_escape_the_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A secret living *outside* both the base and upper roots.
+        fs::write(tmp.path().join("secret.txt"), b"top secret").unwrap();
+        let base = u(&tmp.path().join("base"));
+        let upper = u(&tmp.path().join("upper"));
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&upper).unwrap();
+        fs::write(base.join("ok.txt"), b"ok").unwrap();
+
+        let physical = PhysicalFileView::new(base.clone());
+        let overlay = OverlayFileView::new(base, upper, HashSet::new());
+
+        for bad in ["../secret.txt", "../../secret.txt", "a/../../secret.txt"] {
+            assert!(
+                physical.resolve(Utf8Path::new(bad)).unwrap().is_none(),
+                "physical resolved escaping path {bad:?}"
+            );
+            assert!(physical.read(Utf8Path::new(bad)).is_err());
+            assert!(
+                overlay.resolve(Utf8Path::new(bad)).unwrap().is_none(),
+                "overlay resolved escaping path {bad:?}"
+            );
+            assert!(overlay.read(Utf8Path::new(bad)).is_err());
+        }
+        // ...while a legitimate in-root path still resolves.
+        assert!(physical.resolve(Utf8Path::new("ok.txt")).unwrap().is_some());
     }
 }

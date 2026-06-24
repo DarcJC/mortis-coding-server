@@ -26,7 +26,8 @@ pub use error::{CoreError, Result};
 // Re-export the most-used types at the crate root for ergonomic imports.
 pub use config::{RepoConfig, VcsKind};
 pub use model::{
-    FileContent, Principal, ReadRange, RepoId, Rev, SessionId, Timestamp, slice_file_content,
+    FileContent, Principal, ReadRange, RepoId, Rev, SessionId, Timestamp, ensure_safe_relative,
+    line_range, slice_file_content,
 };
 pub use search::{CaseMode, Flow, SearchEngine, SearchMatch, SearchQuery};
 pub use session::{ChangeKind, FileStatus, Session, SessionStore};

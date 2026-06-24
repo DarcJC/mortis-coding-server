@@ -3,8 +3,16 @@
 //! Pure Rust: no system `git`, no C toolchain. Network transport is HTTPS via
 //! `reqwest` + `rustls`. The backend never checks out a full worktree — instead
 //! it fetches into a bare object store under `<root>/vcs` and *materializes*
-//! only the whitelisted paths of the head tree into `<root>/work`, which is the
-//! read-only base that search and sessions sit on.
+//! only the whitelisted paths of the head tree into an immutable, per-revision
+//! snapshot `<root>/snapshots/<head>`, which is the read-only base that search
+//! and sessions sit on. A re-sync to a new head publishes a new snapshot dir
+//! rather than mutating an existing one, so a live session's base is stable.
+//!
+//! Snapshots are keyed by resolved head only; within a process the whitelist is
+//! constant so the head fully determines content. If an operator edits
+//! `include`/`exclude`, restarts, and the head is unchanged, an existing
+//! snapshot is reused (stale-whitelist, never corrupt) — bump `rev` or delete
+//! the snapshot dir to force a rebuild.
 //!
 //! All `gix` work is blocking, so every trait method moves the work onto a
 //! blocking task and (re)opens the repository inside it — this sidesteps any
@@ -52,7 +60,7 @@ impl VcsBackend for GixBackend {
 
     async fn sync(&self, ctx: &RepoContext<'_>) -> Result<RepoSnapshot> {
         let internal = ctx.internal_dir();
-        let work = ctx.work_dir();
+        let snapshots_dir = ctx.snapshots_dir();
         let url = ctx.spec.url.clone();
         let spec_rev = ctx.spec.rev.clone();
         let include = ctx.spec.include.clone();
@@ -84,23 +92,26 @@ impl VcsBackend for GixBackend {
                 .receive(gix::progress::Discard, &interrupt)
                 .map_err(vcs)?;
 
-            // Resolve the head we want and materialize its whitelisted tree.
+            // Resolve the head and materialize its whitelisted tree into an
+            // immutable, per-revision snapshot directory (published atomically;
+            // an existing snapshot for this head is reused).
             let head = resolve_commit(&repo, &Rev::Head, spec_rev.as_deref())?;
+            let head_hex = head.to_hex().to_string();
             let commit = repo.find_object(head).map_err(vcs)?.try_into_commit().map_err(vcs)?;
             let tree = commit.tree().map_err(vcs)?;
-
             let filter = GlobFilter::new(&include, &exclude)?;
-            if work.exists() {
-                std::fs::remove_dir_all(&work)?;
-            }
-            std::fs::create_dir_all(&work)?;
-            let mut count = 0usize;
-            materialize_tree(&tree, "", &work, &filter, &mut count)?;
+
+            let (base_path, count) =
+                crate::publish::publish_snapshot(&snapshots_dir, &head_hex, |staging| {
+                    let mut count = 0usize;
+                    materialize_tree(&tree, "", staging, &filter, &mut count)?;
+                    Ok(count)
+                })?;
 
             Ok(RepoSnapshot {
                 repo: repo_id,
-                head: head.to_hex().to_string(),
-                base_path: work,
+                head: head_hex,
+                base_path,
                 synced_at: Timestamp::now(),
                 file_count: count,
             })
@@ -178,7 +189,10 @@ impl VcsBackend for GixBackend {
                 };
                 for (i, line) in entry_lines.into_iter().enumerate() {
                     lines.push(BlameLine {
-                        line_no: entry.start_in_blamed_file + i as u32 + 1,
+                        line_no: entry
+                            .start_in_blamed_file
+                            .saturating_add(i as u32)
+                            .saturating_add(1),
                         commit: meta.id.clone(),
                         author: meta.author.clone(),
                         author_email: meta.email.clone(),

@@ -13,15 +13,16 @@
 //! - blame/history: [`Services::blame`], [`Services::history`]
 //! - sessions: create/list/get/delete + write/delete/status/diff/patch
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::Serialize;
 
 use mortis_core::{
     BlameLine, Commit, CoreError, FileContent, LogQuery, Principal, ReadRange, RepoId, RepoSnapshot,
     Result, Rev, SearchEngine, SearchMatch, SearchQuery, Session, SessionId, SessionStore,
-    Timestamp, VcsKind, slice_file_content,
+    Timestamp, VcsKind, ensure_safe_relative, slice_file_content,
 };
 use mortis_fs::PhysicalFileView;
 
@@ -89,9 +90,7 @@ impl Services {
     /// Sync one repository, recording the resulting snapshot.
     pub async fn sync_repo(&self, id: &RepoId) -> Result<RepoSnapshot> {
         let entry = self.repos.get(id)?;
-        let snap = entry.backend.sync(&entry.context()).await?;
-        entry.set_snapshot(snap.clone());
-        Ok(snap)
+        self.sync_one(&entry).await
     }
 
     /// Sync every configured repository, returning per-repo results.
@@ -105,9 +104,41 @@ impl Services {
     }
 
     async fn sync_one(&self, entry: &Arc<RepoEntry>) -> Result<RepoSnapshot> {
+        // Serialize syncs of this repo so the snapshot publish + GC below can't
+        // race a concurrent (scheduled or manual) sync of the same repo.
+        let _guard = entry.sync_lock().await;
         let snap = entry.backend.sync(&entry.context()).await?;
         entry.set_snapshot(snap.clone());
+        // Reclaim snapshot dirs that are now neither current nor session-pinned.
+        self.gc_snapshots(entry).await;
         Ok(snap)
+    }
+
+    /// GC the snapshot directories of a single repo after a sync.
+    async fn gc_snapshots(&self, entry: &RepoEntry) {
+        match self.sessions.referenced_bases().await {
+            Ok(referenced) => gc_entry(entry, &referenced),
+            Err(e) => tracing::warn!(
+                repo = %entry.spec.id,
+                error = %e,
+                "snapshot GC skipped: cannot list session-referenced bases"
+            ),
+        }
+    }
+
+    /// GC every repo's snapshot directories, reusing a single referenced-bases
+    /// scan. Called by the reaper after expiring idle sessions.
+    pub async fn gc_all_snapshots(&self) {
+        let referenced = match self.sessions.referenced_bases().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "snapshot GC skipped: cannot list session-referenced bases");
+                return;
+            }
+        };
+        for entry in self.repos.all() {
+            gc_entry(&entry, &referenced);
+        }
     }
 
     // ---------------------------------------------------------------- search
@@ -115,7 +146,7 @@ impl Services {
     /// Search a single repository's materialized tree.
     pub async fn search_repo(&self, id: &RepoId, query: SearchQuery) -> Result<Vec<SearchMatch>> {
         let entry = self.repos.get(id)?;
-        let view = PhysicalFileView::new(entry.work_dir());
+        let view = PhysicalFileView::new(entry.current_base());
         let mut hits = run_search(self.search.clone(), view, query).await?;
         for m in &mut hits {
             m.repo = Some(id.clone());
@@ -128,7 +159,7 @@ impl Services {
         let max = query.max_results;
         let mut all = Vec::new();
         for entry in self.repos.all() {
-            let view = PhysicalFileView::new(entry.work_dir());
+            let view = PhysicalFileView::new(entry.current_base());
             let mut hits = run_search(self.search.clone(), view, query.clone()).await?;
             let id = entry.spec.id.clone();
             for m in &mut hits {
@@ -168,8 +199,12 @@ impl Services {
         rev: &Rev,
         range: Option<ReadRange>,
     ) -> Result<FileContent> {
+        // Confine the request path: for SVN the path is interpolated into the
+        // peg-revision target URL, where a `..` would escape the configured
+        // repo subtree on the server.
+        let path = ensure_safe_relative(path)?;
         let entry = self.repos.get(id)?;
-        entry.backend.read_file(&entry.context(), path, rev, range).await
+        entry.backend.read_file(&entry.context(), &path, rev, range).await
     }
 
     /// Read a file through a session's overlay view (owner-checked).
@@ -193,8 +228,9 @@ impl Services {
 
     /// Blame a file at a revision against the original repository.
     pub async fn blame(&self, id: &RepoId, path: &Utf8Path, rev: &Rev) -> Result<Vec<BlameLine>> {
+        let path = ensure_safe_relative(path)?;
         let entry = self.repos.get(id)?;
-        entry.backend.blame(&entry.context(), path, rev).await
+        entry.backend.blame(&entry.context(), &path, rev).await
     }
 
     /// Commit history for the repo or one file.
@@ -204,8 +240,9 @@ impl Services {
         path: Option<&Utf8Path>,
         query: &LogQuery,
     ) -> Result<Vec<Commit>> {
+        let path = path.map(ensure_safe_relative).transpose()?;
         let entry = self.repos.get(id)?;
-        entry.backend.history(&entry.context(), path, query).await
+        entry.backend.history(&entry.context(), path.as_deref(), query).await
     }
 
     // --------------------------------------------------------------- session
@@ -331,4 +368,40 @@ async fn run_search_boxed(
 
 fn blocking_err(e: tokio::task::JoinError) -> CoreError {
     CoreError::Other(format!("blocking task failed: {e}"))
+}
+
+/// Remove `entry`'s snapshot directories that are neither the current snapshot
+/// nor pinned by a live session, plus a legacy pre-upgrade `work/` dir once it
+/// is unreferenced. Best-effort: failures are logged and retried next GC pass.
+///
+/// `.staging-*` directories are always skipped — a concurrent publish owns them.
+fn gc_entry(entry: &RepoEntry, referenced: &HashSet<Utf8PathBuf>) {
+    let ctx = entry.context();
+    let current = entry.snapshot().map(|s| s.base_path);
+    let keep = |p: &Utf8PathBuf| current.as_ref() == Some(p) || referenced.contains(p);
+
+    if let Ok(read) = std::fs::read_dir(ctx.snapshots_dir()) {
+        for child in read.flatten() {
+            let Ok(path) = Utf8PathBuf::from_path_buf(child.path()) else {
+                continue;
+            };
+            let is_staging = path
+                .file_name()
+                .is_some_and(|n| n.starts_with(".staging-"));
+            if is_staging || keep(&path) {
+                continue;
+            }
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                tracing::warn!(repo = %entry.spec.id, dir = %path, error = %e,
+                    "failed to reclaim snapshot dir");
+            }
+        }
+    }
+
+    // Legacy pre-upgrade `work/`: reclaim once no session pins it (a session
+    // created before the upgrade keeps it alive until reaped/deleted).
+    let legacy = ctx.work_dir();
+    if legacy.exists() && !keep(&legacy) {
+        let _ = std::fs::remove_dir_all(&legacy);
+    }
 }

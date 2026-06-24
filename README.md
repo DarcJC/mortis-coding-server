@@ -162,7 +162,7 @@ exclude = ["**/*.bin"]        # 在 include 之后应用
 
 - **白名单 glob**：基于仓库相对路径（正斜杠），如 `src/**`、`**/*.rs`。`include` 为空表示全部物化；`exclude` 在其后过滤。
 - **schedule**：能被解析为时长（`humantime`）即按间隔重复，否则按 6 段 cron。
-- **数据目录布局**：`data/repos/<id>/work`（只读物化工作树）、`data/repos/<id>/vcs`（后端内部存储）、`data/sessions/<sid>/`（会话 upper + meta.json）、`data/cache/`（释放的 svn 二进制）。
+- **数据目录布局**：`data/repos/<id>/snapshots/<head>`（按修订号物化的不可变只读快照，会话固定其一；重新同步到新 head 会发布新目录，不再引用的旧快照由 GC 回收）、`data/repos/<id>/vcs`（后端内部存储）、`data/sessions/<sid>/`（会话 upper + meta.json）、`data/cache/`（释放的 svn 二进制）。
 
 ---
 

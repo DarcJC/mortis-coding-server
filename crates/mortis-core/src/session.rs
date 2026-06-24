@@ -9,6 +9,7 @@
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::error::Result;
@@ -92,6 +93,11 @@ pub trait SessionStore: Send + Sync {
 
     /// Delete every session idle for longer than `ttl`. Returns the count.
     async fn reap_expired(&self, ttl: Duration) -> Result<usize>;
+
+    /// The set of base paths currently pinned by any live session (across all
+    /// owners). Drives garbage collection of per-revision repo snapshots: a
+    /// snapshot directory in this set must not be reclaimed.
+    async fn referenced_bases(&self) -> Result<HashSet<Utf8PathBuf>>;
 
     /// Build an overlay [`FileView`] for reads/search within the session.
     async fn view(&self, id: &SessionId) -> Result<Box<dyn FileView>>;

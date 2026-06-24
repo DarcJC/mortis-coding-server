@@ -11,6 +11,7 @@
 
 pub mod filter;
 pub mod git;
+mod publish;
 pub mod svn;
 
 pub use git::GixBackend;

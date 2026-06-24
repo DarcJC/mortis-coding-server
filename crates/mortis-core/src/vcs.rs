@@ -31,7 +31,23 @@ impl<'a> RepoContext<'a> {
         Self { spec, root }
     }
 
-    /// Read-only materialized working tree (the session base, the search root).
+    /// Parent of the immutable per-revision snapshot directories.
+    pub fn snapshots_dir(&self) -> Utf8PathBuf {
+        self.root.join("snapshots")
+    }
+
+    /// The immutable materialized working tree for one resolved `head` (commit
+    /// sha / svn revnum). This is the read-only base a session pins and the
+    /// search root; a re-sync to a *new* head publishes a *new* directory rather
+    /// than mutating an existing one, so live sessions are never disturbed.
+    pub fn snapshot_dir(&self, head: &str) -> Utf8PathBuf {
+        self.snapshots_dir().join(head)
+    }
+
+    /// Legacy single materialized working tree (`<root>/work`).
+    ///
+    /// Superseded by [`snapshot_dir`](Self::snapshot_dir); retained only so the
+    /// snapshot GC can reclaim a pre-upgrade `work/` once no session pins it.
     pub fn work_dir(&self) -> Utf8PathBuf {
         self.root.join("work")
     }
@@ -48,7 +64,9 @@ pub struct RepoSnapshot {
     pub repo: RepoId,
     /// Resolved head revision after the sync (commit sha / svn revnum).
     pub head: String,
-    /// The materialized read-only working tree.
+    /// The immutable, per-revision materialized read-only working tree
+    /// (`<root>/snapshots/<head>`). Stable for the life of any session that
+    /// pins it; a re-sync to a new head publishes a new directory.
     pub base_path: Utf8PathBuf,
     /// When the sync completed.
     pub synced_at: Timestamp,

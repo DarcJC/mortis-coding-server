@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use mortis_app::Services;
 use mortis_core::{
-    CaseMode, LogQuery, Principal, ReadRange, RepoId, Rev, SearchQuery, SessionId,
+    CaseMode, LogQuery, Principal, RepoId, Rev, SearchQuery, SessionId, line_range,
 };
 
 use crate::error::to_mcp_error;
@@ -399,9 +399,3 @@ fn build_query(a: &SearchArgs) -> SearchQuery {
     }
 }
 
-fn line_range(start: Option<u32>, end: Option<u32>) -> Option<ReadRange> {
-    match (start, end) {
-        (None, None) => None,
-        _ => Some(ReadRange::Lines { start: start.unwrap_or(1), end }),
-    }
-}

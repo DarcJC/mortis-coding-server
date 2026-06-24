@@ -1,10 +1,12 @@
 //! Core value types: identifiers, revisions, read ranges, file content, and a
 //! serialization-friendly timestamp.
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::error::{CoreError, Result};
 
 /// Stable identifier of a configured repository (e.g. `"proj-a"`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -136,8 +138,13 @@ impl Timestamp {
     }
 
     /// Convert from a Unix epoch in seconds.
+    ///
+    /// Saturating: a commit with an absurd (attacker- or corruption-supplied)
+    /// author timestamp near `i64::MAX` must not overflow the millisecond
+    /// multiply — that would panic in debug builds and wrap to a bogus time in
+    /// release.
     pub fn from_unix_secs(secs: i64) -> Self {
-        Timestamp((secs.max(0) as u64) * 1000)
+        Timestamp((secs.max(0) as u64).saturating_mul(1000))
     }
 
     /// Back to a [`SystemTime`].
@@ -222,7 +229,11 @@ pub fn slice_file_content(
             let start = (start as usize).min(len);
             let end = end.map(|e| (e as usize).min(len)).unwrap_or(len).max(start);
             let slice = &bytes[start..end];
-            let start_line = count_lines(&String::from_utf8_lossy(&bytes[..start])) + 1;
+            // The 1-based line a byte offset sits on is the number of newlines
+            // strictly before it, plus one. (Using `count_lines` here over-counts
+            // by one whenever `start` falls in the middle of a line.)
+            let start_line =
+                bytes[..start].iter().filter(|&&b| b == b'\n').count() as u32 + 1;
             let text = String::from_utf8_lossy(slice).into_owned();
             let end_line = start_line + count_lines(&text).saturating_sub(1);
             FileContent {
@@ -235,5 +246,95 @@ pub fn slice_file_content(
                 is_binary,
             }
         }
+    }
+}
+
+/// Map optional 1-based line bounds to a [`ReadRange`].
+///
+/// `(None, None)` means "whole file"; otherwise a missing `start` defaults to
+/// line 1. Shared by the REST and MCP adapters so the two surfaces map read
+/// ranges identically.
+pub fn line_range(start: Option<u32>, end: Option<u32>) -> Option<ReadRange> {
+    match (start, end) {
+        (None, None) => None,
+        _ => Some(ReadRange::Lines {
+            start: start.unwrap_or(1),
+            end,
+        }),
+    }
+}
+
+/// Validate and normalize a caller-supplied *relative* path.
+///
+/// Rejects empty paths, absolute paths, and any `..` / root / drive-prefix
+/// component, then re-joins the surviving normal components with forward
+/// slashes. The result is always a relative path that stays inside whatever
+/// root it is later joined onto.
+///
+/// This is the single shared guard for request-supplied paths: the session
+/// store applies it to writes/deletes and the repo-read services apply it to
+/// reads/blame/history, so traversal is rejected identically everywhere.
+pub fn ensure_safe_relative(rel: &Utf8Path) -> Result<Utf8PathBuf> {
+    use camino::Utf8Component;
+
+    if rel.as_str().is_empty() {
+        return Err(CoreError::invalid("empty path"));
+    }
+
+    let mut out = Utf8PathBuf::new();
+    for comp in rel.components() {
+        match comp {
+            Utf8Component::Normal(part) => out.push(part),
+            Utf8Component::ParentDir | Utf8Component::RootDir | Utf8Component::Prefix(_) => {
+                return Err(CoreError::invalid(format!("path escapes root: {rel}")));
+            }
+            // `.` is harmless; drop it.
+            Utf8Component::CurDir => {}
+        }
+    }
+
+    if out.as_str().is_empty() {
+        return Err(CoreError::invalid(format!("path resolves to root: {rel}")));
+    }
+    Ok(Utf8PathBuf::from(out.as_str().replace('\\', "/")))
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn ensure_safe_relative_rejects_escapes() {
+        for bad in ["", "..", "../x", "a/../../b", "/abs", "/etc/passwd"] {
+            assert!(
+                ensure_safe_relative(Utf8Path::new(bad)).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_safe_relative_keeps_normal_paths() {
+        assert_eq!(
+            ensure_safe_relative(Utf8Path::new("src/a.rs")).unwrap(),
+            Utf8PathBuf::from("src/a.rs")
+        );
+        // `.` components are dropped; backslashes are normalized.
+        assert_eq!(
+            ensure_safe_relative(Utf8Path::new("./src/a.rs")).unwrap(),
+            Utf8PathBuf::from("src/a.rs")
+        );
+    }
+
+    #[test]
+    fn byte_range_start_line_is_correct_mid_line() {
+        // "ab\ncd\n": byte 1 ('b') is still on line 1, not line 2.
+        let fc = slice_file_content(
+            "f".into(),
+            b"ab\ncd\n",
+            Some(ReadRange::Bytes { start: 1, end: Some(2) }),
+        );
+        assert_eq!(fc.text, "b");
+        assert_eq!(fc.start_line, 1);
     }
 }

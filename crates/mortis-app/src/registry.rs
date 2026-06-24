@@ -20,12 +20,21 @@ pub struct RepoEntry {
     pub backend: Arc<dyn VcsBackend>,
     /// The latest successful sync, if any. Drives session base resolution.
     snapshot: RwLock<Option<RepoSnapshot>>,
+    /// Serializes syncs of THIS repo so a scheduled and a manual sync can't race
+    /// the snapshot publish or the post-sync GC. Distinct repos sync in parallel.
+    sync_mutex: tokio::sync::Mutex<()>,
 }
 
 impl RepoEntry {
     /// Build the borrow-based context handed to backend calls.
     pub fn context(&self) -> RepoContext<'_> {
         RepoContext::new(&self.spec, &self.root)
+    }
+
+    /// Acquire this repo's sync lock (held across the backend sync + snapshot
+    /// update + GC).
+    pub async fn sync_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.sync_mutex.lock().await
     }
 
     /// The materialized read-only working tree (valid after a sync).
@@ -36,6 +45,15 @@ impl RepoEntry {
     /// A clone of the latest snapshot, if the repo has been synced.
     pub fn snapshot(&self) -> Option<RepoSnapshot> {
         self.snapshot.read().expect("snapshot lock poisoned").clone()
+    }
+
+    /// The current read/search base: the latest snapshot's materialized tree, or
+    /// a not-yet-created snapshot path (which yields empty results) if the repo
+    /// has never been synced.
+    pub fn current_base(&self) -> Utf8PathBuf {
+        self.snapshot()
+            .map(|s| s.base_path)
+            .unwrap_or_else(|| self.context().snapshots_dir())
     }
 
     /// Record a fresh snapshot after a successful sync.
@@ -95,6 +113,7 @@ impl RepoRegistry {
                     root,
                     backend,
                     snapshot: RwLock::new(None),
+                    sync_mutex: tokio::sync::Mutex::new(()),
                 }),
             );
         }

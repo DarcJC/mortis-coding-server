@@ -36,13 +36,13 @@ mod tests {
             VcsKind::Git
         }
         async fn sync(&self, ctx: &RepoContext<'_>) -> Result<RepoSnapshot> {
-            let work = ctx.work_dir();
-            std::fs::create_dir_all(&work).ok();
-            std::fs::write(work.join("a.txt"), b"hello\nworld\n").ok();
+            let base = ctx.snapshot_dir("deadbeef");
+            std::fs::create_dir_all(&base).ok();
+            std::fs::write(base.join("a.txt"), b"hello\nworld\n").ok();
             Ok(RepoSnapshot {
                 repo: ctx.spec.id.clone(),
                 head: "deadbeef".into(),
-                base_path: work,
+                base_path: base,
                 synced_at: Timestamp(1),
                 file_count: 1,
             })
@@ -84,7 +84,11 @@ mod tests {
         }
     }
 
-    struct NoSessions;
+    #[derive(Default)]
+    struct NoSessions {
+        /// Base paths a test wants `referenced_bases` to report (drives GC tests).
+        bases: std::sync::Mutex<std::collections::HashSet<Utf8PathBuf>>,
+    }
     #[async_trait]
     impl SessionStore for NoSessions {
         async fn create(
@@ -134,6 +138,9 @@ mod tests {
         async fn reap_expired(&self, _ttl: std::time::Duration) -> Result<usize> {
             Ok(0)
         }
+        async fn referenced_bases(&self) -> Result<std::collections::HashSet<Utf8PathBuf>> {
+            Ok(self.bases.lock().unwrap().clone())
+        }
         async fn view(&self, id: &SessionId) -> Result<Box<dyn FileView>> {
             Err(CoreError::not_found(id.0.clone()))
         }
@@ -156,7 +163,7 @@ mod tests {
     fn services_over(tmp: &Utf8Path, repos: Vec<RepoConfig>) -> Services {
         let backends = BackendSet { git: Arc::new(FakeGit), svn: None };
         let reg = Arc::new(RepoRegistry::build(repos, tmp, &backends).unwrap());
-        Services::new(reg, Arc::new(NoSearch), Arc::new(NoSessions))
+        Services::new(reg, Arc::new(NoSearch), Arc::new(NoSessions::default()))
     }
 
     #[tokio::test]
@@ -197,6 +204,88 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.code(), "config_error");
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_current_and_referenced_reclaims_rest() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // A backend whose head advances each sync, materializing snapshots/rev<n>.
+        struct FakeGitSeq {
+            n: AtomicU32,
+        }
+        #[async_trait]
+        impl VcsBackend for FakeGitSeq {
+            fn kind(&self) -> VcsKind {
+                VcsKind::Git
+            }
+            async fn sync(&self, ctx: &RepoContext<'_>) -> Result<RepoSnapshot> {
+                let n = self.n.fetch_add(1, Ordering::SeqCst) + 1;
+                let head = format!("rev{n}");
+                let base = ctx.snapshot_dir(&head);
+                std::fs::create_dir_all(&base).unwrap();
+                std::fs::write(base.join("f.txt"), b"x").unwrap();
+                Ok(RepoSnapshot {
+                    repo: ctx.spec.id.clone(),
+                    head,
+                    base_path: base,
+                    synced_at: Timestamp(n as u64),
+                    file_count: 1,
+                })
+            }
+            async fn list_files(&self, _c: &RepoContext<'_>, _a: &Rev) -> Result<Vec<Utf8PathBuf>> {
+                Ok(vec![])
+            }
+            async fn read_file(
+                &self,
+                _c: &RepoContext<'_>,
+                p: &Utf8Path,
+                _a: &Rev,
+                r: Option<ReadRange>,
+            ) -> Result<FileContent> {
+                Ok(slice_file_content(p.to_owned(), b"", r))
+            }
+            async fn blame(&self, _c: &RepoContext<'_>, _p: &Utf8Path, _a: &Rev) -> Result<Vec<BlameLine>> {
+                Ok(vec![])
+            }
+            async fn history(
+                &self,
+                _c: &RepoContext<'_>,
+                _p: Option<&Utf8Path>,
+                _q: &LogQuery,
+            ) -> Result<Vec<Commit>> {
+                Ok(vec![])
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let backends = BackendSet {
+            git: Arc::new(FakeGitSeq { n: AtomicU32::new(0) }),
+            svn: None,
+        };
+        let reg = Arc::new(RepoRegistry::build(vec![spec("r1", VcsKind::Git)], &root, &backends).unwrap());
+        let sessions = Arc::new(NoSessions::default());
+        let svc = Services::new(reg, Arc::new(NoSearch), sessions.clone());
+
+        // sync #1 -> snapshots/rev1 (current). Pretend a live session pins it.
+        let snap1 = svc.sync_repo(&RepoId::from("r1")).await.unwrap();
+        assert!(snap1.base_path.exists());
+        sessions.bases.lock().unwrap().insert(snap1.base_path.clone());
+
+        // sync #2 -> snapshots/rev2 (current). GC must keep BOTH rev2 (current)
+        // and rev1 (still referenced by the session) — proving a re-sync never
+        // reclaims a snapshot a session pinned.
+        let snap2 = svc.sync_repo(&RepoId::from("r1")).await.unwrap();
+        assert_ne!(snap1.base_path, snap2.base_path);
+        assert!(snap1.base_path.exists(), "referenced snapshot kept");
+        assert!(snap2.base_path.exists(), "current snapshot kept");
+
+        // Session goes away; GC reclaims the now-unreferenced rev1, never rev2.
+        sessions.bases.lock().unwrap().clear();
+        svc.gc_all_snapshots().await;
+        assert!(!snap1.base_path.exists(), "unreferenced old snapshot reclaimed");
+        assert!(snap2.base_path.exists(), "current snapshot still kept");
     }
 
     #[test]
