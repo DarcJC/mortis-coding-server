@@ -7,8 +7,9 @@
 #   2. apt 安装系统依赖：subversion(SVN 后端) / python3+venv(supervisor) /
 #      build-essential、cmake 等(从源码构建 Rust，aws-lc-rs 需要 C 编译器) /
 #      lldb、llvm、binutils(汇编/二进制调试工具链，为后续命令执行沙箱预装)。
-#   3. 始终从源码 `cargo build --release` 构建（缺 cargo 自动装 rustup；REPO_ROOT
-#      不是 git 仓库时，自动从 --repo-url 克隆源码后再编译）。
+#   3. 增量构建/部署：git 仓库先 `git pull`；仅当有新提交或二进制缺失时才
+#      `cargo build --release` 并更新二进制，随后按需经 supervisorctl 重启服务
+#      （缺 cargo 自动装 rustup；REPO_ROOT 非 git 仓库时，自动从 --repo-url 克隆）。
 #   4. 创建专用系统用户 mortis 与 FHS 目录布局，安装二进制（setcap 授予绑定
 #      <1024 特权端口能力，使非 root 的 mortis 可监听 80/443）+ 生成 config.toml。
 #   5. 用 pip+venv 安装 supervisor（规避 PEP 668），写好 supervisord/程序配置。
@@ -61,6 +62,11 @@ INSTALL_DIR="$INSTALL_DIR_DEFAULT"
 CONFIG_PATH="$CONFIG_PATH_DEFAULT"
 DATA_DIR="$DATA_DIR_DEFAULT"
 REPO_URL=""
+
+# 部署过程中由各阶段设置，驱动“有更新才重编/重启”的增量逻辑
+SOURCE_UPDATED=0    # git pull 拉到新提交（或全新克隆）时置 1 → 触发重新编译
+BINARY_UPDATED=0    # 安装目录中的二进制内容发生变化时置 1 → 需要重启
+CONFIG_CHANGED=0    # config.toml 内容发生变化时置 1 → 需要重启
 
 # ---- 日志辅助 ---------------------------------------------------------------
 c_reset=$'\033[0m'; c_blue=$'\033[1;34m'; c_green=$'\033[1;32m'
@@ -184,11 +190,38 @@ run_as_builder() {
     sudo -u "$BUILD_USER" -H bash -lc "$1"
   fi
 }
+# 同上，但用非登录 shell（不加载 profile），便于干净地捕获命令输出（如 git rev-parse）
+run_as_builder_q() {
+  if [ "$BUILD_USER" = "root" ]; then
+    bash -c "$1"
+  else
+    sudo -u "$BUILD_USER" -H bash -c "$1"
+  fi
+}
 
-# ---- 源码就绪：REPO_ROOT 非 git 仓库则克隆（可能重定向 REPO_ROOT） ----------
+# ---- 拉取 git 更新：HEAD 变化（拉到新提交）则置 SOURCE_UPDATED=1 ------------
+pull_repo() {
+  local dir="$1" before after
+  before="$(run_as_builder_q "git -C '$dir' rev-parse HEAD 2>/dev/null" || true)"
+  info "检查 git 更新：$dir"
+  if run_as_builder "git -C '$dir' pull --ff-only"; then
+    after="$(run_as_builder_q "git -C '$dir' rev-parse HEAD 2>/dev/null" || true)"
+    if [ -n "$after" ] && [ "$before" != "$after" ]; then
+      SOURCE_UPDATED=1
+      ok "拉取到更新：${before:0:12} → ${after:0:12}（将重新编译）"
+    else
+      info "源码已是最新，无需更新。"
+    fi
+  else
+    warn "git pull 失败（可能有本地改动/网络问题/非快进），沿用现有源码。"
+  fi
+}
+
+# ---- 源码就绪：git 仓库则拉取更新；非 git 仓库则克隆（可能重定向 REPO_ROOT） --
 ensure_source() {
   if [ -e "$REPO_ROOT/.git" ]; then
     info "构建源码：$REPO_ROOT（git 仓库，就地构建）"
+    pull_repo "$REPO_ROOT"
     return
   fi
 
@@ -209,21 +242,23 @@ ensure_source() {
   fi
 
   if [ -e "$target/.git" ]; then
-    info "复用已存在的克隆：$target（git pull 更新）"
-    run_as_builder "git -C '$target' pull --ff-only" || warn "更新失败，沿用现有源码"
+    info "复用已存在的克隆：$target"
+    REPO_ROOT="$target"
+    pull_repo "$target"
   else
     if [ "$target" != "$REPO_ROOT" ] && [ -e "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
       die "克隆目标已存在且非空：$target，请清理后重试（或用 --repo-url 指定其它源）。"
     fi
     run_as_builder "git clone --depth 1 '$url' '$target'"
+    SOURCE_UPDATED=1                  # 全新克隆 → 视为有更新，需编译
+    REPO_ROOT="$target"
   fi
 
-  [ -f "$target/Cargo.toml" ] || die "克隆完成但未找到 Cargo.toml：$target（仓库地址/分支是否正确？）"
-  REPO_ROOT="$target"
+  [ -f "$REPO_ROOT/Cargo.toml" ] || die "克隆完成但未找到 Cargo.toml：$REPO_ROOT（仓库地址/分支是否正确？）"
   ok "源码已就绪：$REPO_ROOT"
 }
 
-# ---- 始终从源码构建 ---------------------------------------------------------
+# ---- 从源码构建（仅在源码有更新或二进制缺失时编译） -------------------------
 build_binary() {
   if [ "$SKIP_BUILD" -eq 1 ]; then
     local bin="$REPO_ROOT/target/release/mortis-code-server"
@@ -233,9 +268,18 @@ build_binary() {
   fi
 
   resolve_build_user
-  ensure_source                       # 非 git 仓库则克隆源码；可能重定向 REPO_ROOT
+  ensure_source                       # 拉取/克隆源码并探测更新；可能重定向 REPO_ROOT
   local bin="$REPO_ROOT/target/release/mortis-code-server"
-  info "将以用户 '$BUILD_USER' 从源码构建（始终重新编译）"
+
+  if [ "$SOURCE_UPDATED" -eq 0 ] && [ -x "$bin" ]; then
+    info "源码无更新且已存在二进制，跳过编译：$bin"
+    return
+  fi
+  if [ "$SOURCE_UPDATED" -eq 1 ]; then
+    info "检测到源码更新 → 以用户 '$BUILD_USER' 重新编译"
+  else
+    info "未找到现有二进制 → 以用户 '$BUILD_USER' 首次编译"
+  fi
 
   if ! run_as_builder '. "$HOME/.cargo/env" 2>/dev/null || true; command -v cargo >/dev/null'; then
     info "未检测到 cargo，正在为 '$BUILD_USER' 安装 rustup (stable)…"
@@ -268,11 +312,17 @@ setup_user_and_dirs() {
   ok "目录布局就绪"
 }
 
-# ---- 安装二进制 -------------------------------------------------------------
+# ---- 安装二进制（仅当内容变化或目标缺失时覆盖，并标记需要重启） -------------
 install_binary() {
-  install -m 0755 "$REPO_ROOT/target/release/mortis-code-server" \
-                  "$INSTALL_DIR/bin/mortis-code-server"
-  ok "已安装二进制到 $INSTALL_DIR/bin/mortis-code-server"
+  local src="$REPO_ROOT/target/release/mortis-code-server"
+  local dst="$INSTALL_DIR/bin/mortis-code-server"
+  if [ -x "$dst" ] && cmp -s "$src" "$dst"; then
+    info "二进制无变化，跳过更新：$dst"
+    return
+  fi
+  install -m 0755 "$src" "$dst"
+  BINARY_UPDATED=1
+  ok "已安装二进制到 $dst"
 }
 
 # ---- 授予绑定特权端口的能力（让非 root 的 mortis 也能监听 80/443 等 <1024 端口） ----
@@ -377,7 +427,7 @@ write_config() {
   tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"
   prin="${prin//\\/\\\\}"; prin="${prin//\"/\\\"}"
 
-  cat > "$CONFIG_PATH" <<EOF
+  cat > "$CONFIG_PATH.new" <<EOF
 # mortis-code-server 配置（由 scripts/deploy-ubuntu.sh 生成）
 # 环境变量覆盖使用 MORTIS_ 前缀、__ 表示嵌套，例如 MORTIS_SERVER__BIND=0.0.0.0:9000
 
@@ -406,9 +456,17 @@ reap_interval = "10m"
 # exclude = []
 EOF
 
-  chown "$SVC_USER:$SVC_USER" "$CONFIG_PATH"
-  chmod 0640 "$CONFIG_PATH"
-  ok "已生成配置：$CONFIG_PATH"
+  chown "$SVC_USER:$SVC_USER" "$CONFIG_PATH.new"
+  chmod 0640 "$CONFIG_PATH.new"
+
+  if [ -f "$CONFIG_PATH" ] && cmp -s "$CONFIG_PATH.new" "$CONFIG_PATH"; then
+    rm -f "$CONFIG_PATH.new"
+    info "配置无变化：$CONFIG_PATH"
+  else
+    mv -f "$CONFIG_PATH.new" "$CONFIG_PATH"
+    CONFIG_CHANGED=1
+    ok "已生成配置：$CONFIG_PATH"
+  fi
 }
 
 # ---- 安装 supervisor（pip + venv，规避 PEP 668） ----------------------------
@@ -491,16 +549,28 @@ wait_supervisor() {
 reload_program() {
   "$SUPERVISORCTL" -c "$SUP_CONF" reread || true
   "$SUPERVISORCTL" -c "$SUP_CONF" update || true
-  "$SUPERVISORCTL" -c "$SUP_CONF" restart mortis-code-server || true
+  if [ "${NEED_RESTART:-0}" -eq 1 ]; then
+    info "二进制或配置有更新，通过 supervisorctl 重启服务…"
+    "$SUPERVISORCTL" -c "$SUP_CONF" restart mortis-code-server || true
+  else
+    "$SUPERVISORCTL" -c "$SUP_CONF" start mortis-code-server >/dev/null 2>&1 || true
+    info "二进制与配置均无更新，未重启（已确保服务在运行）。"
+  fi
 }
 
 # ---- 启动 supervisord 并配置开机自启（三级回退） ----------------------------
 BOOT_MODE=""
 start_and_enable() {
+  # 仅当二进制或配置发生变化时才需要重启服务
+  NEED_RESTART=0
+  [ "${BINARY_UPDATED:-0}" -eq 1 ] && NEED_RESTART=1
+  [ "${CONFIG_CHANGED:-0}" -eq 1 ] && NEED_RESTART=1
+
   if [ -d /run/systemd/system ]; then
     BOOT_MODE="systemd"
     info "检测到 systemd，写入 supervisord.service 并设为开机自启…"
-    cat > /etc/systemd/system/supervisord.service <<EOF
+    local unit=/etc/systemd/system/supervisord.service unit_changed=0
+    cat > "$unit.new" <<EOF
 [Unit]
 Description=Supervisor process control system (mortis-code-server)
 After=network.target
@@ -516,9 +586,22 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+    if [ -f "$unit" ] && cmp -s "$unit.new" "$unit"; then
+      rm -f "$unit.new"
+    else
+      mv -f "$unit.new" "$unit"; unit_changed=1
+    fi
     systemctl daemon-reload
     systemctl enable supervisord >/dev/null 2>&1 || true
-    systemctl restart supervisord
+    if ! systemctl is-active --quiet supervisord; then
+      info "启动 supervisord…"
+      systemctl start supervisord
+    elif [ "$unit_changed" -eq 1 ]; then
+      info "supervisord 单元已更新，重启 supervisord…"
+      systemctl restart supervisord
+    else
+      info "supervisord 已在运行，无需重启（仅按需重载服务）。"
+    fi
     wait_supervisor || die "supervisord 启动失败，请查看 $SUP_LOG_DIR/supervisord.log"
     reload_program
 
@@ -546,6 +629,11 @@ print_summary() {
   local exposed_note=""
   [ "$HOST" = "0.0.0.0" ] && exposed_note="  ${c_yellow}（监听所有网卡，请确保防火墙与 token 已妥善配置）${c_reset}"
   printf '\n%s========== 部署完成 ==========%s\n' "$c_green" "$c_reset"
+  if [ "${BINARY_UPDATED:-0}" -eq 1 ] || [ "${CONFIG_CHANGED:-0}" -eq 1 ]; then
+    printf '本次执行 : 检测到更新，已重新部署并重启服务\n'
+  else
+    printf '本次执行 : 无更新，服务保持原样运行\n'
+  fi
   printf '监听地址 : http://%s:%s%s\n' "$HOST" "$PORT" "$exposed_note"
   printf '          REST → /api/v1    MCP → /mcp\n'
   printf 'principal: %s\n' "$PRINCIPAL"
