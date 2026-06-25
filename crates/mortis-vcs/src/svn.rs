@@ -16,8 +16,8 @@ use tokio::process::Command;
 
 use mortis_core::vcs::RepoContext;
 use mortis_core::{
-    BlameLine, Commit, CoreError, FileContent, LogQuery, ReadRange, RepoSnapshot, Result, Rev,
-    Timestamp, VcsBackend, VcsKind, slice_file_content,
+    BlameLine, Commit, CoreError, FileContent, LogQuery, ReadRange, RepoId, RepoSnapshot, Result,
+    Rev, Timestamp, VcsBackend, VcsKind, slice_file_content,
 };
 
 use crate::filter::GlobFilter;
@@ -71,6 +71,17 @@ impl SvnCliBackend {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
+        // svn often warns on stderr while still exiting 0 (e.g. skipped items);
+        // surface it at debug. `args` never carries the password (passed via a
+        // separate `--password`); redact URL userinfo defensively.
+        if !output.stderr.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
+            let safe: Vec<String> = args.iter().map(|a| crate::util::redact_url(a)).collect();
+            tracing::debug!(
+                args = ?safe,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "svn: command emitted stderr"
+            );
+        }
         Ok(output.stdout)
     }
 }
@@ -119,11 +130,17 @@ impl VcsBackend for SvnCliBackend {
         let user = ctx.spec.username.as_deref();
         let pass = ctx.spec.password.as_deref();
 
+        tracing::info!(
+            repo = %ctx.spec.id, url = %crate::util::redact_url(url), rev = ?rev,
+            "svn sync: starting"
+        );
+
         // Resolve the concrete revision number for the snapshot.
         let info = self
             .run(user, pass, &["info", "--show-item", "revision", &target(url, None, &rev)])
             .await?;
         let head = String::from_utf8_lossy(&info).trim().to_string();
+        tracing::info!(repo = %ctx.spec.id, revision = %head, "svn sync: resolved revision");
 
         // Export the tree (no .svn metadata) to a temp dir, then materialize the
         // whitelisted subset into an immutable, per-revision snapshot. Skip the
@@ -136,12 +153,29 @@ impl VcsBackend for SvnCliBackend {
             if let Some(parent) = export_dir.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            self.run(
-                user,
-                pass,
-                &["export", "--force", &target(url, None, &rev), export_dir.as_str()],
-            )
-            .await?;
+            let tgt = target(url, None, &rev);
+            tracing::debug!(
+                repo = %ctx.spec.id, target = %crate::util::redact_url(&tgt), dir = %export_dir,
+                "svn sync: exporting"
+            );
+            // On failure, remove the half-written export so it can't masquerade
+            // on disk as a "successful but incomplete" pull.
+            if let Err(e) = self
+                .run(user, pass, &["export", "--force", &tgt, export_dir.as_str()])
+                .await
+            {
+                std::fs::remove_dir_all(&export_dir).ok();
+                return Err(e);
+            }
+            tracing::debug!(
+                repo = %ctx.spec.id, exported = count_files_in(&export_dir),
+                "svn sync: export complete"
+            );
+        } else {
+            tracing::debug!(
+                repo = %ctx.spec.id, revision = %head,
+                "svn sync: snapshot for revision exists, skipping export"
+            );
         }
 
         let filter = GlobFilter::new(&ctx.spec.include, &ctx.spec.exclude)?;
@@ -153,6 +187,16 @@ impl VcsBackend for SvnCliBackend {
             })?;
         // The export is just a staging area; reclaim its space.
         std::fs::remove_dir_all(&export_dir).ok();
+
+        tracing::info!(
+            repo = %ctx.spec.id, revision = %head, files = count, base = %base_path,
+            include = ?ctx.spec.include, exclude = ?ctx.spec.exclude,
+            "svn sync: materialized snapshot"
+        );
+        // Per-top-level-dir counts make a "some folders missing" symptom obvious.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            log_top_level_breakdown(&ctx.spec.id, &base_path);
+        }
 
         Ok(RepoSnapshot {
             repo: ctx.spec.id.clone(),
@@ -321,6 +365,44 @@ fn copy_filtered(
         }
     }
     Ok(())
+}
+
+/// Best-effort recursive file count under `dir` (diagnostics only; never errors).
+fn count_files_in(dir: &Utf8Path) -> usize {
+    let mut n = 0;
+    if let Ok(rd) = std::fs::read_dir(dir.as_std_path()) {
+        for e in rd.flatten() {
+            match e.file_type() {
+                Ok(ft) if ft.is_dir() => {
+                    if let Ok(p) = Utf8PathBuf::from_path_buf(e.path()) {
+                        n += count_files_in(&p);
+                    }
+                }
+                Ok(ft) if ft.is_file() => n += 1,
+                _ => {}
+            }
+        }
+    }
+    n
+}
+
+/// Log per-top-level-entry file counts of a materialized snapshot, so a
+/// "some folders are missing" symptom is directly visible in the logs.
+fn log_top_level_breakdown(id: &RepoId, base: &Utf8Path) {
+    let mut breakdown: Vec<(String, usize)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(base.as_std_path()) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let count = match (e.file_type(), Utf8PathBuf::from_path_buf(e.path())) {
+                (Ok(ft), Ok(p)) if ft.is_dir() => count_files_in(&p),
+                (Ok(ft), _) if ft.is_file() => 1,
+                _ => 0,
+            };
+            breakdown.push((name, count));
+        }
+    }
+    breakdown.sort();
+    tracing::debug!(repo = %id, ?breakdown, "svn sync: per-top-level file counts");
 }
 
 // --------------------------- svn --xml deserialization structs ---------------

@@ -163,6 +163,8 @@ fn config_for(root: &Utf8Path, remote: &Utf8Path) -> Config {
             bind: "127.0.0.1:0".into(),
             data_dir: root.join("data"),
             svn_bin: None,
+            log_file: None,
+            log_level: None,
         },
         auth: AuthConfig {
             tokens: vec![

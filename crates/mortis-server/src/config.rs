@@ -36,6 +36,14 @@ pub struct ServerConfig {
     /// Explicit path to an `svn` executable. Overrides embedded/system lookup.
     #[serde(default)]
     pub svn_bin: Option<Utf8PathBuf>,
+    /// Optional log file path. When set, logs are also written here in plain
+    /// text (no ANSI color), in addition to stdout. Unset → stdout only.
+    #[serde(default)]
+    pub log_file: Option<Utf8PathBuf>,
+    /// Tracing filter directives, e.g. `"info,mortis_vcs=debug"`. Precedence:
+    /// this value > the `RUST_LOG` env var > `"info"`.
+    #[serde(default)]
+    pub log_level: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -44,6 +52,8 @@ impl Default for ServerConfig {
             bind: default_bind(),
             data_dir: default_data_dir(),
             svn_bin: None,
+            log_file: None,
+            log_level: None,
         }
     }
 }

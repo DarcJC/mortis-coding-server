@@ -10,6 +10,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod logging;
 pub mod mcp;
 pub mod rest;
 pub mod scheduler;
@@ -94,6 +95,13 @@ pub fn build_app(state: AppState) -> Router {
 /// scheduler, and serve until the process is stopped.
 pub async fn run(config: Config) -> anyhow::Result<()> {
     use anyhow::Context;
+
+    // Initialize logging before anything else so all startup output is captured.
+    // Hold the guard (if a file sink is configured) for the whole server life.
+    let _log_guard = logging::init(
+        config.server.log_file.as_deref(),
+        config.server.log_level.as_deref(),
+    )?;
 
     let bind = config.server.bind.clone();
     let ttl = config.session.ttl_duration();

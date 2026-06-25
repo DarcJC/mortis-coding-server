@@ -9,6 +9,13 @@ bind = "127.0.0.1:8080"
 data_dir = "./data"
 # Optional: force a specific svn executable (otherwise embedded → system).
 # svn_bin = "/usr/bin/svn"
+# Optional: also write logs to this file (plain text, no ANSI), in addition to
+# stdout. Unset → stdout only. Env override: MORTIS_SERVER__LOG_FILE.
+# log_file = "./data/app.log"
+# Optional: tracing filter. Precedence: this > RUST_LOG env var > "info".
+# Use "info,mortis_vcs=debug" to trace git/svn sync in detail.
+# Env override: MORTIS_SERVER__LOG_LEVEL.
+# log_level = "info"
 
 [auth]
 # Every API/MCP request must send `Authorization: Bearer <token>`.
@@ -48,6 +55,12 @@ rev = "master"               # branch/tag/commit; omit for the remote default
 schedule = "30m"             # 6-field cron OR a human interval like "30m"
 include = ["**/*"]           # whitelist globs; empty list = materialize all
 exclude = []
+# Private repos: sync prefers the system `git` CLI, so an existing credential
+# helper (GCM / osxkeychain / store), SSH key, or custom CA cert is reused
+# automatically — no token needed here. Otherwise set credentials explicitly
+# (fed to git via askpass, or to the gix fallback when git is absent):
+# username = "git"           # for a PAT: any username + the token as password
+# password = "ghp_xxxxxxxx"
 
 # [[repo]]
 # id = "trunk-svn"

@@ -2,7 +2,7 @@
 
 把多个 **Git / SVN 代码仓库**封装成一个服务：同时对外提供 **REST/JSON API** 和 **HTTP Streamable MCP**（Model Context Protocol），面向人和 AI Agent。提供代码搜索、范围读取、blame、提交历史，以及**会话级 copy-on-write 写入层**（写入/删除不触碰原始仓库，可生成 status/diff/patch）。
 
-纯 Rust（Git 后端零 C 工具链），**同时兼容 Windows 与 Linux**，单进程、单二进制。
+Git 读取走纯 Rust（gix），同步优先复用系统 `git`（凭据助手/SSH/证书开箱即用，无 git 时回退纯 Rust 拉取），**同时兼容 Windows 与 Linux**，单进程、单二进制。
 
 ---
 
@@ -37,7 +37,7 @@
 - **diff / search-replace 写入**：除整文件覆盖外，可用**统一 diff（严格 apply）**或**字面 search/replace 块**原子地修改会话文件；diff 无法干净 apply（或搜索文本缺失/不唯一）时返回明确错误，绝不静默落到错误位置。
 - **汇编查询会话**：传入临时二进制 URL（须在主机白名单内）异步下载并校验是否为合法 **Windows(PE) / Linux·Android(ELF) / iOS·macOS(Mach-O，含 fat)** 文件；可查询下载进度与校验结果，并对就绪二进制做**按地址段反汇编**（`capstone`，x86/x64/ARM/ARM64）、**地址→函数名**、**头/段元数据**查询。
 - **鉴权**：Bearer Token；一个 principal 可拥有多个会话，会话私有。
-- **自包含**：Git 纯 Rust（rustls 传输）；SVN 通过可内嵌的 `svn` 二进制，缺失时回退系统 `svn`。
+- **自包含**：Git 读取走纯 Rust gix；同步优先用系统 `git`（复用凭据助手/SSH/证书/代理），无 git 时回退纯 Rust（rustls）拉取。SVN 通过可内嵌的 `svn` 二进制，缺失时回退系统 `svn`。
 
 ---
 
@@ -115,7 +115,7 @@ Client ──Bearer──► axum ──auth mw（注入 Principal）──► r
 ### 前置
 
 - **Rust** ≥ 1.85（edition 2024）。`rustup` 安装即可。
-- **Git 后端**：无需系统 git、无需 C 工具链（纯 Rust + rustls）。
+- **Git 后端**：同步默认调用系统 `git`（复用凭据助手/SSH/证书/代理；一键部署脚本已 `apt install git`），无 `git` 时回退 gix 纯 Rust + rustls 拉取；读取/blame/历史/物化始终走 gix。
   - 注：默认 TLS 走 `reqwest` + `rustls`，其加密后端 `aws-lc-rs` 在构建时需要 C 编译器（多数平台有预编译，Windows 需要 MSVC 构建工具）。如需完全免 C，可改用 ring/纯 Rust provider（见 [限制](#限制与-roadmap)）。
 - **SVN 后端**：可选。运行期需要一个 `svn` 可执行文件——内嵌（见[内嵌 SVN](#内嵌-svn-二进制)）或系统安装（Linux `apt install subversion`；Windows 安装 SlikSVN/TortoiseSVN 命令行）。无 SVN 仓库则无需 svn。
 - **测试**：集成测试需要系统 `git`（构造夹具）；SVN 测试需要 `svn`/`svnadmin`（缺失则自动跳过）。
@@ -140,6 +140,8 @@ Windows（PowerShell）相同命令即可。
 bind = "127.0.0.1:8080"        # 监听地址；对外服务用 0.0.0.0:8080
 data_dir = "./data"            # 物化仓库 / 会话 / 缓存根目录
 # svn_bin = "/usr/bin/svn"     # 可选：强制指定 svn 可执行文件
+# log_file = "./data/app.log"  # 可选：同时写入该日志文件（纯文本无颜色）
+# log_level = "info"           # 可选：tracing 过滤；优先级 此 > RUST_LOG > "info"
 
 [auth]
 # 每个请求都需 Authorization: Bearer <token>；token 映射到 principal。
@@ -166,7 +168,10 @@ rev = "main"                   # Git: 分支/标签/提交；SVN: 修订号/HEAD
 schedule = "15m"              # 6 段 cron 或人类间隔（"15m"/"1h"）；省略则不自动更新
 include = ["src/**", "*.md"]  # 白名单 glob；空 = 物化全部
 exclude = ["**/*.bin"]        # 在 include 之后应用
-# username / password         # 认证仓库可选
+# 私有仓库：同步优先用系统 git，自动复用凭据助手(GCM 等)/SSH/证书，通常无需在此填写；
+# 也可显式填 username/password（经 GIT_ASKPASS 传给 git，或无 git 时传给 gix 回退）。
+# username = "git"            # 用 PAT 时：任意用户名 + token 作为 password
+# password = "ghp_xxxxxxxx"
 ```
 
 ### 字段语义要点
@@ -175,6 +180,8 @@ exclude = ["**/*.bin"]        # 在 include 之后应用
 - **schedule**：能被解析为时长（`humantime`）即按间隔重复，否则按 6 段 cron。
 - **`[asm].allowed_hosts`（默认拒绝）**：下载二进制的 SSRF 防线——空列表表示禁用下载；条目可为精确主机（`example.com`）或前导点域名通配（`.example.com` 同时匹配子域）。仅允许 http/https，超过 `max_download_bytes` 或 `download_timeout` 即判失败；下载器禁用重定向，避免白名单主机 302 跳到非白名单目标。
 - **数据目录布局**：`data/repos/<id>/snapshots/<head>`（按修订号物化的不可变只读快照，会话固定其一；重新同步到新 head 会发布新目录，不再引用的旧快照由 GC 回收）、`data/repos/<id>/vcs`（后端内部存储）、`data/sessions/<sid>/`（会话 upper + meta.json）、`data/asm/<aid>/`（汇编会话下载的二进制）、`data/cache/`（释放的 svn 二进制）。
+- **日志**：默认仅 stdout（是 TTY 才带颜色）。设 `[server].log_file` 同时写纯文本日志文件（无颜色，便于 `tail`/留存）；`[server].log_level`（或 `RUST_LOG`）控制级别——排查同步用 `"info,mortis_vcs=debug"`，可看到 git/svn 实际命令、解析的修订与按目录的拷贝计数。环境变量覆盖：`MORTIS_SERVER__LOG_FILE` / `MORTIS_SERVER__LOG_LEVEL`。
+- **Git 鉴权**：同步默认走系统 `git`，复用其凭据助手/SSH/证书/代理；若填了 `username`/`password` 则强制使用之（经 GIT_ASKPASS，密码不进命令行）。无 `git` 时回退 gix 纯 Rust 并注入所填凭据。
 
 ---
 
@@ -187,6 +194,8 @@ RUST_LOG=info ./target/release/mortis-code-server config.toml
 ```
 
 启动时会后台触发一次全量同步，并按各仓库 `schedule` 注册定时同步与会话 TTL 回收。
+
+> 日志：默认输出到 stdout。需要持久化时设 `[server].log_file`（或 `MORTIS_SERVER__LOG_FILE`）写入文件；排查 git/svn 同步设 `RUST_LOG=info,mortis_vcs=debug` 或 `[server].log_level`。一键部署默认写 `/var/log/mortis-code-server/app.log` 且已开启 `mortis_vcs=debug`。
 
 健康检查（无需鉴权）：
 
@@ -489,7 +498,7 @@ bash scripts/fetch-svn.sh
 
 - 逻辑路径在 `mortis-fs` 与各后端统一为正斜杠，REST/MCP 响应在两平台一致。
 - 路径用 `camino::Utf8Path`，缓存/数据目录用 `directories`。
-- Git 走 gix 纯 Rust，两平台一致，无需系统 git。
+- Git 读取走 gix 纯 Rust，两平台一致；同步优先用系统 `git`（无则回退 gix 拉取）。
 - 内嵌 svn 释放时按平台设置可执行位与动态库搜索路径。
 - 读取/diff 处理 CRLF/LF 与非 UTF-8（`grep-searcher` 编码探测；非 UTF-8 以有损方式解码）。
 
@@ -503,7 +512,7 @@ bash scripts/fetch-svn.sh
 | MCP 报 "Not Acceptable" | `Accept` 必须同时包含 `application/json` 与 `text/event-stream`。 |
 | MCP 报 "Invalid Host header" | 使用标准 HTTP 客户端（自带 `Host`）；勿发送空 Host。 |
 | SVN 仓库报 config 错误 | 未找到 svn：安装系统 svn、设置 `[server].svn_bin`，或填充内嵌资产。 |
-| 同步失败 | 看日志（`RUST_LOG=info`/`debug`）；确认 URL、`rev`、凭据与网络。 |
+| 同步失败 | 看日志（`RUST_LOG=info,mortis_vcs=debug` 或 `[server].log_level`；部署见 `/var/log/mortis-code-server/app.log`）；确认 URL、`rev`、凭据与网络。私有 Git：装好 `git` 并配置凭据助手，或在 `[[repo]]` 填 `username`/`password`。 |
 | 默认分支解析不到 | 显式设置 `[[repo]].rev`（如 `"main"`/`"master"`）。 |
 
 ---

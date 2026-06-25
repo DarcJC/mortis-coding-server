@@ -13,6 +13,7 @@ pub mod filter;
 pub mod git;
 mod publish;
 pub mod svn;
+mod util;
 
 pub use git::GixBackend;
 pub use svn::{SvnCliBackend, SvnTool};

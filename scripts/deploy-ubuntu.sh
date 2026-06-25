@@ -4,9 +4,9 @@
 #
 # 功能：
 #   1. 校验系统为 Ubuntu，否则提前报错退出。
-#   2. apt 安装系统依赖：subversion(SVN 后端) / python3+venv(supervisor) /
-#      build-essential、cmake 等(从源码构建 Rust，aws-lc-rs 需要 C 编译器) /
-#      lldb、llvm、binutils(汇编/二进制调试工具链，为后续命令执行沙箱预装)。
+#   2. apt 安装系统依赖：subversion(SVN 后端) / git(Git 同步后端 + 拉源码) /
+#      python3+venv(supervisor) / build-essential、cmake 等(从源码构建 Rust，
+#      aws-lc-rs 需要 C 编译器) / lldb、llvm、binutils(汇编/二进制调试工具链)。
 #   3. 增量构建/部署：git 仓库先 `git pull`；仅当有新提交或二进制缺失时才
 #      `cargo build --release` 并更新二进制，随后按需经 supervisorctl 重启服务
 #      （缺 cargo 自动装 rustup；REPO_ROOT 非 git 仓库时，自动从 --repo-url 克隆）。
@@ -177,7 +177,8 @@ install_system_deps() {
   # binutils → GNU objdump/readelf/nm/addr2line；llvm → llvm-objdump/llvm-readobj 等；
   # lldb → LLVM 调试器。供下一阶段的命令执行沙箱调试二进制汇编。
   # libcap2-bin → 提供 setcap，用于授予二进制绑定 <1024 特权端口（如 80/443）的能力。
-  ok "系统依赖安装完成（含 subversion、libcap2-bin、lldb/llvm/binutils 汇编调试工具链）"
+  # git → Git 同步后端首选系统 git fetch（复用凭据助手/SSH/证书/代理），并用于拉取源码。
+  ok "系统依赖安装完成（含 subversion、git、libcap2-bin、lldb/llvm/binutils 汇编调试工具链）"
 }
 
 # ---- 以构建用户身份执行命令（保持 target/ 归属正常） ------------------------
@@ -578,7 +579,7 @@ startsecs=5
 startretries=3
 stopsignal=TERM
 stopwaitsecs=15
-environment=RUST_LOG="info",HOME="$DATA_DIR"
+environment=RUST_LOG="info",HOME="$DATA_DIR",MORTIS_SERVER__LOG_FILE="$LOG_DIR/app.log",MORTIS_SERVER__LOG_LEVEL="info,mortis_vcs=debug"
 stdout_logfile=$LOG_DIR/stdout.log
 stderr_logfile=$LOG_DIR/stderr.log
 stdout_logfile_maxbytes=10MB
@@ -710,7 +711,8 @@ print_summary() {
     printf '  配置     %s\n' "$CONFIG_PATH"
   fi
   printf '  数据     %s\n' "$DATA_DIR"
-  printf '  日志     %s/{stdout,stderr}.log\n' "$LOG_DIR"
+  printf '  日志     %s/app.log （应用主日志，已开启 mortis_vcs=debug 诊断）\n' "$LOG_DIR"
+  printf '           %s/{stdout,stderr}.log （supervisor 捕获的标准输出/错误）\n' "$LOG_DIR"
   printf '  运行用户 %s\n' "$SVC_USER"
   printf '\n开机自启 : %s' "$BOOT_MODE"
   case "$BOOT_MODE" in
@@ -723,6 +725,7 @@ print_summary() {
   printf '\n常用命令:\n'
   printf '  supervisorctl status\n'
   printf '  supervisorctl restart mortis-code-server\n'
+  printf '  tail -f %s/app.log              # 应用日志（含 VCS 同步诊断）\n' "$LOG_DIR"
   printf '  supervisorctl tail -f mortis-code-server stderr\n'
   printf '\n修改配置后重载：编辑 %s 然后 supervisorctl restart mortis-code-server\n' "$CONFIG_PATH"
 }
