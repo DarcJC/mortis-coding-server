@@ -77,7 +77,7 @@ async fn svn_sync_read_blame_history() {
         env: Vec::new(),
         source: ToolSource::System,
     };
-    let backend = SvnCliBackend::new(tool);
+    let backend = SvnCliBackend::new(tool, root.clone());
 
     let data = root.join("data");
     let spec = RepoConfig {

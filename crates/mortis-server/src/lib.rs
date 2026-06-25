@@ -47,7 +47,7 @@ pub fn build_services(config: Config) -> anyhow::Result<(AppState, Arc<Services>
     // without a tool then fails fast at registry build with a clear message.
     let cache_dir = data_dir.join("cache");
     let svn: Option<Arc<dyn mortis_core::VcsBackend>> =
-        match mortis_vcs::SvnCliBackend::resolve(&cache_dir, config.server.svn_bin.as_deref()) {
+        match mortis_vcs::SvnCliBackend::resolve(&cache_dir, config.server.svn_bin.as_deref(), &data_dir) {
             Ok(backend) => {
                 tracing::info!("svn backend ready (source: {:?})", backend.source());
                 Some(Arc::new(backend))
@@ -93,8 +93,9 @@ pub fn build_app(state: AppState) -> Router {
 
 /// Full server lifecycle: build services, kick off an initial sync, start the
 /// scheduler, and serve until the process is stopped.
-pub async fn run(config: Config) -> anyhow::Result<()> {
+pub async fn run(mut config: Config) -> anyhow::Result<()> {
     use anyhow::Context;
+    use camino::Utf8PathBuf;
 
     // Initialize logging before anything else so all startup output is captured.
     // Hold the guard (if a file sink is configured) for the whole server life.
@@ -102,6 +103,35 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         config.server.log_file.as_deref(),
         config.server.log_level.as_deref(),
     )?;
+
+    // Pin the process working directory to the (server-owned) data dir before any
+    // VCS work runs. Both backends ultimately call `getcwd()`: the `svn` CLI
+    // inherits our CWD, and `gix::open` queries the CWD inside `is_git()`. If the
+    // inherited CWD has been removed out from under us — e.g. the launcher
+    // (supervisor `directory=`) chdir'd into a data dir that was later relocated —
+    // every `getcwd()` fails with ENOENT, surfacing as svn `E125001` and gix
+    // `"…does not appear to be a git repository"`. Anchoring the CWD to a directory
+    // we create ourselves makes the service self-healing regardless of how it is
+    // launched. Absolutize first so all later `data_dir.join(..)` stay
+    // CWD-independent (a relative data_dir must not be re-resolved against the new
+    // CWD into `data/data/…`).
+    let data_dir = config.server.data_dir.clone();
+    std::fs::create_dir_all(&data_dir).with_context(|| format!("creating data_dir {data_dir}"))?;
+    let data_dir = if data_dir.is_absolute() {
+        data_dir
+    } else {
+        let cwd = std::env::current_dir().context(
+            "resolving current dir to absolutize a relative data_dir \
+             (set an absolute [server].data_dir to avoid this)",
+        )?;
+        Utf8PathBuf::from_path_buf(cwd)
+            .map_err(|p| anyhow::anyhow!("non-utf8 current dir: {}", p.display()))?
+            .join(&data_dir)
+    };
+    std::env::set_current_dir(&data_dir)
+        .with_context(|| format!("pinning process working directory to {data_dir}"))?;
+    config.server.data_dir = data_dir.clone();
+    tracing::info!(data_dir = %data_dir, "pinned process working directory to data dir");
 
     let bind = config.server.bind.clone();
     let ttl = config.session.ttl_duration();

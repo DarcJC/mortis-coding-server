@@ -28,17 +28,31 @@ pub use mortis_embed::{SvnTool, ToolSource};
 #[derive(Debug, Clone)]
 pub struct SvnCliBackend {
     tool: SvnTool,
+    /// Directory the `svn` child is spawned in. svn resolves `.` at startup —
+    /// even for URL-only remote operations — so if it inherits the process CWD
+    /// and that has been removed, it aborts with `E125001: Couldn't determine
+    /// absolute path of '.'`. Anchoring to a server-owned, guaranteed-existing
+    /// directory (the data dir) makes svn independent of the inherited CWD.
+    work_dir: Utf8PathBuf,
 }
 
 impl SvnCliBackend {
-    pub fn new(tool: SvnTool) -> Self {
-        Self { tool }
+    pub fn new(tool: SvnTool, work_dir: Utf8PathBuf) -> Self {
+        Self { tool, work_dir }
     }
 
     /// Resolve an `svn` tool (embedded → system, or an explicit override) and
-    /// build a backend. `cache_dir` is where embedded binaries are extracted.
-    pub fn resolve(cache_dir: &Utf8Path, override_path: Option<&Utf8Path>) -> Result<Self> {
-        Ok(Self::new(mortis_embed::resolve_svn(cache_dir, override_path)?))
+    /// build a backend. `cache_dir` is where embedded binaries are extracted;
+    /// `work_dir` is the (already-existing) directory the `svn` child runs in.
+    pub fn resolve(
+        cache_dir: &Utf8Path,
+        override_path: Option<&Utf8Path>,
+        work_dir: &Utf8Path,
+    ) -> Result<Self> {
+        Ok(Self::new(
+            mortis_embed::resolve_svn(cache_dir, override_path)?,
+            work_dir.to_owned(),
+        ))
     }
 
     /// Where the resolved svn came from (embedded/system/override).
@@ -58,6 +72,9 @@ impl SvnCliBackend {
     /// last so it wins over any LC_ALL/LANG inherited from the service env.
     fn build_command(&self, spec_user: Option<&str>, spec_pass: Option<&str>, args: &[&str]) -> Command {
         let mut cmd = Command::new(self.tool.program.as_std_path());
+        // Spawn svn from a known-existing directory so its startup `getcwd(".")`
+        // can't fail (E125001) when the inherited process CWD has been removed.
+        cmd.current_dir(self.work_dir.as_std_path());
         cmd.arg("--non-interactive");
         if let Some(u) = spec_user {
             cmd.args(["--username", u]);
@@ -473,11 +490,14 @@ mod tests {
     use std::ffi::{OsStr, OsString};
 
     fn backend(env: Vec<(String, String)>) -> SvnCliBackend {
-        SvnCliBackend::new(SvnTool {
-            program: Utf8PathBuf::from("svn"),
-            env,
-            source: ToolSource::System,
-        })
+        SvnCliBackend::new(
+            SvnTool {
+                program: Utf8PathBuf::from("svn"),
+                env,
+                source: ToolSource::System,
+            },
+            Utf8PathBuf::from("/svn/work/anchor"),
+        )
     }
 
     fn env_of(cmd: &Command) -> HashMap<OsString, OsString> {
@@ -509,5 +529,17 @@ mod tests {
         let env = env_of(&cmd);
         assert_eq!(env.get(OsStr::new("LC_ALL")).map(|v| v.as_os_str()), Some(OsStr::new("C.UTF-8")));
         assert_eq!(env.get(OsStr::new("LANG")).map(|v| v.as_os_str()), Some(OsStr::new("C.UTF-8")));
+    }
+
+    /// Regression: the svn child must be anchored to an explicit working
+    /// directory so its startup `getcwd(".")` can't fail with `E125001` when the
+    /// inherited process CWD has been removed (e.g. a relocated data dir).
+    #[test]
+    fn anchors_svn_cwd_to_work_dir() {
+        let cmd = backend(vec![]).build_command(None, None, &["info"]);
+        assert_eq!(
+            cmd.as_std().get_current_dir(),
+            Some(std::path::Path::new("/svn/work/anchor")),
+        );
     }
 }

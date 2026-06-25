@@ -542,8 +542,29 @@ install_supervisor() {
   ok "supervisor 安装完成：$("$SUPERVISORD" --version 2>/dev/null || echo '?')"
 }
 
+# 解析“服务实际使用的”data_dir：优先取（可能被 --preserve 保留的）config.toml 中的值，
+# 回退到部署变量 $DATA_DIR。supervisor 的 directory=（进程 CWD）/HOME= 必须与之一致，
+# 否则改了 config.toml 的 data_dir 后，进程会被 chdir 到一个已不存在的旧目录，
+# svn 在启动 getcwd 处报 E125001、gix 在 is_git 的 getcwd 处报“not a git repository”。
+effective_data_dir() {
+  local v=""
+  if [ -f "$CONFIG_PATH" ]; then
+    v="$(grep -E '^[[:space:]]*data_dir[[:space:]]*=' "$CONFIG_PATH" 2>/dev/null \
+          | head -n1 | sed -E 's/.*=[[:space:]]*"(.*)"[[:space:]]*$/\1/')"
+  fi
+  [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$DATA_DIR"
+}
+
 # ---- 写 supervisord 主配置 + 程序配置 ---------------------------------------
 write_supervisor_conf() {
+  # supervisor 必须以服务真正使用的 data_dir 作为 directory=/HOME=（见 effective_data_dir）。
+  local eff_data_dir; eff_data_dir="$(effective_data_dir)"
+  if [ "$eff_data_dir" != "$DATA_DIR" ]; then
+    warn "config.toml 的 data_dir（$eff_data_dir）与 --data-dir（$DATA_DIR）不一致；"
+    warn "supervisor 的 directory=/HOME= 以 config.toml 为准（$eff_data_dir）。"
+  fi
+  # directory= 必须在进程启动前就存在，否则 supervisor chdir 失败、程序无法拉起。
+  install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$eff_data_dir" || true
   cat > "$SUP_CONF" <<'EOF'
 ; supervisord 主配置（由 mortis-code-server 部署脚本生成）
 [unix_http_server]
@@ -571,7 +592,7 @@ EOF
   cat > "$SUP_PROG_CONF" <<EOF
 [program:mortis-code-server]
 command=$INSTALL_DIR/bin/mortis-code-server $CONFIG_PATH
-directory=$DATA_DIR
+directory=$eff_data_dir
 user=$SVC_USER
 autostart=true
 autorestart=true
@@ -582,7 +603,7 @@ stopwaitsecs=15
 ; LANG/LC_ALL=C.UTF-8：强制进程树使用 glibc 内置的 UTF-8 locale（无需 locale-gen），
 ; 避免宿主机未生成的 locale（如 en_US.UTF-8）导致 svn 回退到 ASCII、在中文文件名上
 ; 报 E000022 而中断导出。svn 子进程在代码层也会再强制一次，此处为纵深防御并惠及 git。
-environment=LANG="C.UTF-8",LC_ALL="C.UTF-8",RUST_LOG="info",HOME="$DATA_DIR",MORTIS_SERVER__LOG_FILE="$LOG_DIR/app.log",MORTIS_SERVER__LOG_LEVEL="info,mortis_vcs=debug"
+environment=LANG="C.UTF-8",LC_ALL="C.UTF-8",RUST_LOG="info",HOME="$eff_data_dir",MORTIS_SERVER__LOG_FILE="$LOG_DIR/app.log",MORTIS_SERVER__LOG_LEVEL="info,mortis_vcs=debug"
 stdout_logfile=$LOG_DIR/stdout.log
 stderr_logfile=$LOG_DIR/stderr.log
 stdout_logfile_maxbytes=10MB
