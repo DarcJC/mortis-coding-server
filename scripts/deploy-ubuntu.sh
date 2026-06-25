@@ -579,7 +579,10 @@ startsecs=5
 startretries=3
 stopsignal=TERM
 stopwaitsecs=15
-environment=RUST_LOG="info",HOME="$DATA_DIR",MORTIS_SERVER__LOG_FILE="$LOG_DIR/app.log",MORTIS_SERVER__LOG_LEVEL="info,mortis_vcs=debug"
+; LANG/LC_ALL=C.UTF-8：强制进程树使用 glibc 内置的 UTF-8 locale（无需 locale-gen），
+; 避免宿主机未生成的 locale（如 en_US.UTF-8）导致 svn 回退到 ASCII、在中文文件名上
+; 报 E000022 而中断导出。svn 子进程在代码层也会再强制一次，此处为纵深防御并惠及 git。
+environment=LANG="C.UTF-8",LC_ALL="C.UTF-8",RUST_LOG="info",HOME="$DATA_DIR",MORTIS_SERVER__LOG_FILE="$LOG_DIR/app.log",MORTIS_SERVER__LOG_LEVEL="info,mortis_vcs=debug"
 stdout_logfile=$LOG_DIR/stdout.log
 stderr_logfile=$LOG_DIR/stderr.log
 stdout_logfile_maxbytes=10MB

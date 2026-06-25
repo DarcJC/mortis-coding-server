@@ -46,8 +46,17 @@ impl SvnCliBackend {
         self.tool.source
     }
 
-    /// Run `svn` with the given args (always non-interactive), returning stdout.
-    async fn run(&self, spec_user: Option<&str>, spec_pass: Option<&str>, args: &[&str]) -> Result<Vec<u8>> {
+    /// Build the `svn` command for `args` (always non-interactive).
+    ///
+    /// Forces a guaranteed-present UTF-8 locale (`C.UTF-8`) so svn can convert
+    /// non-ASCII path names (e.g. Chinese) to the filesystem encoding. Without
+    /// it, a host whose configured locale (e.g. `en_US.UTF-8`) isn't generated
+    /// makes svn warn `cannot set LC_CTYPE locale`, fall back to ASCII, and
+    /// abort `export` with `E000022: Can't convert string from 'UTF-8' to
+    /// native encoding` on the first non-ASCII filename — leaving the pull
+    /// incomplete. `C.UTF-8` is built into glibc (no `locale-gen` needed); set
+    /// last so it wins over any LC_ALL/LANG inherited from the service env.
+    fn build_command(&self, spec_user: Option<&str>, spec_pass: Option<&str>, args: &[&str]) -> Command {
         let mut cmd = Command::new(self.tool.program.as_std_path());
         cmd.arg("--non-interactive");
         if let Some(u) = spec_user {
@@ -60,7 +69,15 @@ impl SvnCliBackend {
         for (k, v) in &self.tool.env {
             cmd.env(k, v);
         }
-        let output = cmd
+        cmd.env("LC_ALL", "C.UTF-8");
+        cmd.env("LANG", "C.UTF-8");
+        cmd
+    }
+
+    /// Run `svn` with the given args (always non-interactive), returning stdout.
+    async fn run(&self, spec_user: Option<&str>, spec_pass: Option<&str>, args: &[&str]) -> Result<Vec<u8>> {
+        let output = self
+            .build_command(spec_user, spec_pass, args)
             .output()
             .await
             .map_err(|e| CoreError::Vcs(format!("failed to spawn svn: {e}")))?;
@@ -447,4 +464,50 @@ struct LogEntryXml {
     author: Option<String>,
     date: Option<String>,
     msg: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
+
+    fn backend(env: Vec<(String, String)>) -> SvnCliBackend {
+        SvnCliBackend::new(SvnTool {
+            program: Utf8PathBuf::from("svn"),
+            env,
+            source: ToolSource::System,
+        })
+    }
+
+    fn env_of(cmd: &Command) -> HashMap<OsString, OsString> {
+        cmd.as_std()
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+            .collect()
+    }
+
+    /// Regression: svn must run under a guaranteed-present UTF-8 locale so it
+    /// can write non-ASCII (e.g. Chinese) filenames. Otherwise `export` aborts
+    /// with `E000022` on the first such path and the pull is incomplete.
+    #[test]
+    fn forces_utf8_locale_on_svn_child() {
+        let env = env_of(&backend(vec![]).build_command(None, None, &["info"]));
+        assert_eq!(env.get(OsStr::new("LC_ALL")).map(|v| v.as_os_str()), Some(OsStr::new("C.UTF-8")));
+        assert_eq!(env.get(OsStr::new("LANG")).map(|v| v.as_os_str()), Some(OsStr::new("C.UTF-8")));
+    }
+
+    /// The forced locale must override anything inherited via the tool env, so
+    /// a stale `en_US.UTF-8` can't reintroduce the bug.
+    #[test]
+    fn locale_override_beats_tool_env() {
+        let cmd = backend(vec![
+            ("LC_ALL".into(), "en_US.UTF-8".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
+        ])
+        .build_command(None, None, &["info"]);
+        let env = env_of(&cmd);
+        assert_eq!(env.get(OsStr::new("LC_ALL")).map(|v| v.as_os_str()), Some(OsStr::new("C.UTF-8")));
+        assert_eq!(env.get(OsStr::new("LANG")).map(|v| v.as_os_str()), Some(OsStr::new("C.UTF-8")));
+    }
 }
