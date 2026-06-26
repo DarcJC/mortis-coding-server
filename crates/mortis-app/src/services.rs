@@ -20,26 +20,34 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::Serialize;
 
 use mortis_core::{
-    AsmSession, AsmSessionId, AssemblyStore, BinaryInfo, BlameLine, Commit, CoreError, Disassembly,
-    FileContent, FunctionResolution, LogQuery, Principal, ReadRange, RepoId, RepoSnapshot, Result,
-    Rev, SearchEngine, SearchMatch, SearchQuery, Session, SessionId, SessionStore, Timestamp,
-    VcsKind, ensure_safe_relative, slice_file_content,
+    AsmSession, AsmSessionId, AssemblyStore, BinaryInfo, BlameLine, CancelToken, Commit, CoreError,
+    Disassembly, FileContent, FunctionResolution, LogQuery, Principal, ReadRange, RepoId,
+    RepoSnapshot, Result, Rev, SearchEngine, SearchMatch, SearchQuery, Session, SessionId,
+    SessionStore, Timestamp, VcsKind, ensure_safe_relative, slice_file_content,
 };
 use mortis_fs::PhysicalFileView;
 
 use crate::registry::{RepoEntry, RepoRegistry};
 
-/// Max repositories processed in parallel for per-repo disk fan-out
-/// ([`Services::search_all`] and [`Services::rehydrate_all`]).
-///
-/// Each per-repo task offloads a blocking walk (ripgrep / `count_files`) onto
-/// the blocking pool, so this bounds both simultaneous blocking tasks and
-/// independent disk walks. Kept small: on a cold page cache / single spinning
-/// disk (the cold-start failure mode), unbounded fan-out just maximizes seek
-/// thrash. Four overlaps enough to hide per-repo latency on typical multi-repo
-/// configs without saturating one disk, and is far under tokio's default
-/// 512-thread blocking pool. Tunable up for SSD/NVMe.
-const REPO_FANOUT_CONCURRENCY: usize = 4;
+/// Tunable per-process limits, sourced from configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Max repositories processed in parallel for per-repo disk fan-out
+    /// ([`Services::search_all`] / [`Services::rehydrate_all`]).
+    ///
+    /// Each per-repo task offloads a blocking walk (ripgrep / `count_files`)
+    /// onto the blocking pool, so this bounds both simultaneous blocking tasks
+    /// and independent disk walks. Kept modest by default: on a cold page cache
+    /// / single spinning disk (the cold-start failure mode), unbounded fan-out
+    /// just maximizes seek thrash. Tunable up for SSD/NVMe. Must be ≥ 1.
+    pub repo_fanout: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { repo_fanout: 4 }
+    }
+}
 
 /// A read-side summary of one repository, for `list_repos`.
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +70,7 @@ pub struct Services {
     search: Arc<dyn SearchEngine>,
     sessions: Arc<dyn SessionStore>,
     asm: Arc<dyn AssemblyStore>,
+    limits: Limits,
 }
 
 impl Services {
@@ -70,8 +79,9 @@ impl Services {
         search: Arc<dyn SearchEngine>,
         sessions: Arc<dyn SessionStore>,
         asm: Arc<dyn AssemblyStore>,
+        limits: Limits,
     ) -> Self {
-        Self { repos, search, sessions, asm }
+        Self { repos, search, sessions, asm, limits }
     }
 
     /// Access the underlying registry (used by the scheduler).
@@ -128,7 +138,7 @@ impl Services {
         use futures::stream::{self, StreamExt};
 
         stream::iter(self.repos.all())
-            .for_each_concurrent(REPO_FANOUT_CONCURRENCY, |entry| async move {
+            .for_each_concurrent(self.limits.repo_fanout, |entry| async move {
                 match entry.backend.rehydrate(&entry.context()).await {
                     Ok(Some(snap)) => {
                         tracing::info!(
@@ -191,11 +201,13 @@ impl Services {
     /// Search a single repository's materialized tree.
     pub async fn search_repo(&self, id: &RepoId, query: SearchQuery) -> Result<Vec<SearchMatch>> {
         let entry = self.repos.get(id)?;
-        let Some(base) = entry.current_base() else {
+        // Lease the base so GC can't reclaim it mid-walk; hold across the search.
+        let Some(lease) = entry.lease_current() else {
             return Ok(Vec::new()); // not synced yet → no results (never walk the parent dir)
         };
-        let view = PhysicalFileView::new(base);
+        let view = PhysicalFileView::new(lease.base_path().to_owned());
         let mut hits = run_search(self.search.clone(), view, query).await?;
+        drop(lease);
         for m in &mut hits {
             m.repo = Some(id.clone());
         }
@@ -224,19 +236,22 @@ impl Services {
                 let search = self.search.clone();
                 let query = query.clone();
                 async move {
-                    let Some(base) = entry.current_base() else {
+                    // Lease inside the per-repo future so an early-break that
+                    // drops the future also drops the lease (and cancels the walk).
+                    let Some(lease) = entry.lease_current() else {
                         return Ok::<Vec<SearchMatch>, CoreError>(Vec::new());
                     };
-                    let view = PhysicalFileView::new(base);
+                    let view = PhysicalFileView::new(lease.base_path().to_owned());
                     let mut hits = run_search(search, view, query).await?;
                     let id = entry.spec.id.clone();
                     for m in &mut hits {
                         m.repo = Some(id.clone());
                     }
+                    drop(lease);
                     Ok(hits)
                 }
             })
-            .buffered(REPO_FANOUT_CONCURRENCY);
+            .buffered(self.limits.repo_fanout);
 
         let mut all = Vec::new();
         while let Some(hits) = stream.next().await {
@@ -325,12 +340,19 @@ impl Services {
     /// Create a session over a repo's current head (must be synced first).
     pub async fn create_session(&self, principal: &Principal, repo: &RepoId) -> Result<Session> {
         let entry = self.repos.get(repo)?;
-        let snap = entry.snapshot().ok_or_else(|| {
-            CoreError::Conflict(format!("repo {repo} has not been synced yet"))
-        })?;
-        self.sessions
+        // Lease the base across the persist so GC can't reclaim it before the
+        // session durably pins it on disk; after `create` returns,
+        // `referenced_bases` covers it — a gapless handoff.
+        let Some(lease) = entry.lease_current() else {
+            return Err(CoreError::Conflict(format!("repo {repo} has not been synced yet")));
+        };
+        let snap = lease.snapshot();
+        let session = self
+            .sessions
             .create(principal, repo, &snap.head, &snap.base_path)
-            .await
+            .await?;
+        drop(lease);
+        Ok(session)
     }
 
     /// List the caller's sessions.
@@ -519,13 +541,26 @@ impl Services {
     }
 }
 
+/// Cancels the wrapped token when dropped. Bound as a local in `run_search*` so
+/// that dropping the search future (e.g. a `search_all` early-break) signals the
+/// detached blocking walk to stop at its next file instead of running to the end.
+struct CancelOnDrop(CancelToken);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Run a search over a concrete view on the blocking pool.
 async fn run_search(
     engine: Arc<dyn SearchEngine>,
     view: PhysicalFileView,
     query: SearchQuery,
 ) -> Result<Vec<SearchMatch>> {
-    tokio::task::spawn_blocking(move || engine.search(&view, &query))
+    let cancel = CancelToken::new();
+    let _guard = CancelOnDrop(cancel.clone()); // cancels if THIS future is dropped
+    let task_cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || engine.search_cancellable(&view, &query, &task_cancel))
         .await
         .map_err(blocking_err)?
 }
@@ -536,7 +571,10 @@ async fn run_search_boxed(
     view: Box<dyn mortis_core::FileView>,
     query: SearchQuery,
 ) -> Result<Vec<SearchMatch>> {
-    tokio::task::spawn_blocking(move || engine.search(&*view, &query))
+    let cancel = CancelToken::new();
+    let _guard = CancelOnDrop(cancel.clone());
+    let task_cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || engine.search_cancellable(&*view, &query, &task_cancel))
         .await
         .map_err(blocking_err)?
 }
@@ -552,9 +590,16 @@ fn blocking_err(e: tokio::task::JoinError) -> CoreError {
 /// `.staging-*` directories are always skipped — a concurrent publish owns them.
 fn gc_entry(entry: &RepoEntry, referenced: &HashSet<Utf8PathBuf>) {
     let ctx = entry.context();
-    let current = entry.snapshot().map(|s| s.base_path);
-    let keep = |p: &Utf8PathBuf| current.as_ref() == Some(p) || referenced.contains(p);
+    // Capture the current base and every leased base atomically (one leases
+    // lock hold), then classify + delete lock-free. A dir we mark for deletion
+    // is non-current and unleased at capture time, and readers only ever lease
+    // the current base — so it can never gain a lease before we remove it.
+    let (current, leased) = entry.gc_protected();
+    let keep = |p: &Utf8PathBuf| {
+        current.as_ref() == Some(p) || referenced.contains(p) || leased.contains(p)
+    };
 
+    let mut to_delete = Vec::new();
     if let Ok(read) = std::fs::read_dir(ctx.snapshots_dir()) {
         for child in read.flatten() {
             let Ok(path) = Utf8PathBuf::from_path_buf(child.path()) else {
@@ -566,10 +611,13 @@ fn gc_entry(entry: &RepoEntry, referenced: &HashSet<Utf8PathBuf>) {
             if is_staging || keep(&path) {
                 continue;
             }
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                tracing::warn!(repo = %entry.spec.id, dir = %path, error = %e,
-                    "failed to reclaim snapshot dir");
-            }
+            to_delete.push(path);
+        }
+    }
+    for path in to_delete {
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(repo = %entry.spec.id, dir = %path, error = %e,
+                "failed to reclaim snapshot dir");
         }
     }
 

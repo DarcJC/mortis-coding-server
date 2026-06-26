@@ -16,7 +16,9 @@ use tower::ServiceExt;
 
 use mortis_core::config::{RepoConfig, VcsKind};
 use mortis_core::RepoId;
-use mortis_server::config::{AsmConfig, AuthConfig, Config, ServerConfig, SessionConfig, TokenEntry};
+use mortis_server::config::{
+    AsmConfig, AuthConfig, Config, LimitsConfig, ServerConfig, SessionConfig, TokenEntry,
+};
 use mortis_server::{build_app, build_services};
 
 fn u(p: &std::path::Path) -> Utf8PathBuf {
@@ -189,6 +191,7 @@ fn config_for(root: &Utf8Path, remote: &Utf8Path) -> Config {
             reap_interval: "10m".into(),
         },
         asm: AsmConfig::default(),
+        limits: LimitsConfig::default(),
     }
 }
 

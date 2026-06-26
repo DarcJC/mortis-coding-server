@@ -2,8 +2,8 @@
 //! its configuration, on-disk location, the [`VcsBackend`] strategy that serves
 //! it, and the most recent sync snapshot.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -23,6 +23,10 @@ pub struct RepoEntry {
     /// Serializes syncs of THIS repo so a scheduled and a manual sync can't race
     /// the snapshot publish or the post-sync GC. Distinct repos sync in parallel.
     sync_mutex: tokio::sync::Mutex<()>,
+    /// Active reader/creator leases on snapshot bases (base_path → count). A
+    /// non-zero count pins that base against GC while a search walks it or a
+    /// session-create persists. A std `Mutex` — never held across `.await`.
+    leases: Mutex<HashMap<Utf8PathBuf, usize>>,
 }
 
 impl RepoEntry {
@@ -61,6 +65,72 @@ impl RepoEntry {
     /// Record a fresh snapshot after a successful sync.
     pub fn set_snapshot(&self, snap: RepoSnapshot) {
         *self.snapshot.write().expect("snapshot lock poisoned") = Some(snap);
+    }
+
+    /// Lease the current snapshot so GC will not reclaim its base while the
+    /// returned [`BaseLease`] is alive. Returns the snapshot + guard, or `None`
+    /// if the repo has no snapshot yet.
+    ///
+    /// Reads the current base and increments its lease under a single `leases`
+    /// lock hold, so the (read-current, increment) pair is atomic against
+    /// [`gc_protected`](Self::gc_protected). A reader therefore always leases
+    /// whatever GC observes as current — which GC never deletes.
+    pub fn lease_current(self: &Arc<Self>) -> Option<BaseLease> {
+        let mut leases = self.leases.lock().expect("leases lock poisoned");
+        let snapshot = self.snapshot()?;
+        *leases.entry(snapshot.base_path.clone()).or_insert(0) += 1;
+        Some(BaseLease { entry: Arc::clone(self), snapshot })
+    }
+
+    /// Snapshot the GC keep-inputs atomically: the current base plus every
+    /// leased base, read under one `leases` lock hold.
+    ///
+    /// Reading `current` here (rather than via a separate later `snapshot()`)
+    /// is load-bearing: it makes the keep-set consistent with concurrent
+    /// [`lease_current`](Self::lease_current) calls, closing the window where a
+    /// reader could lease a base GC is about to delete.
+    pub(crate) fn gc_protected(&self) -> (Option<Utf8PathBuf>, HashSet<Utf8PathBuf>) {
+        let leases = self.leases.lock().expect("leases lock poisoned");
+        let current = self.snapshot().map(|s| s.base_path);
+        let leased = leases.keys().cloned().collect();
+        (current, leased)
+    }
+
+    /// Drop one lease on `base` (called by [`BaseLease`]'s `Drop`).
+    fn release_lease(&self, base: &Utf8Path) {
+        let mut leases = self.leases.lock().expect("leases lock poisoned");
+        if let Some(count) = leases.get_mut(base) {
+            *count -= 1;
+            if *count == 0 {
+                leases.remove(base);
+            }
+        }
+    }
+}
+
+/// An RAII lease pinning a repository's snapshot base against GC for as long as
+/// it is held. Obtain via [`RepoEntry::lease_current`]; dropping it releases the
+/// pin. Holds an `Arc<RepoEntry>` so the entry outlives the lease.
+pub struct BaseLease {
+    entry: Arc<RepoEntry>,
+    snapshot: RepoSnapshot,
+}
+
+impl BaseLease {
+    /// The leased snapshot.
+    pub fn snapshot(&self) -> &RepoSnapshot {
+        &self.snapshot
+    }
+
+    /// The leased base path (the materialized read-only tree).
+    pub fn base_path(&self) -> &Utf8Path {
+        &self.snapshot.base_path
+    }
+}
+
+impl Drop for BaseLease {
+    fn drop(&mut self) {
+        self.entry.release_lease(&self.snapshot.base_path);
     }
 }
 
@@ -116,6 +186,7 @@ impl RepoRegistry {
                     backend,
                     snapshot: RwLock::new(None),
                     sync_mutex: tokio::sync::Mutex::new(()),
+                    leases: Mutex::new(HashMap::new()),
                 }),
             );
         }

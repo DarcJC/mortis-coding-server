@@ -112,7 +112,13 @@ pub(crate) fn rehydrate_snapshot(
     let Some((mtime, head, base_path)) = newest else {
         return Ok(None);
     };
-    let file_count = count_files(&base_path)?;
+    // Non-fatal: a valid base is worth adopting even if the count walk hits a
+    // transient I/O error — the next sync recomputes it exactly.
+    let file_count = count_files(&base_path).unwrap_or_else(|e| {
+        tracing::warn!(repo = %repo, base = %base_path, error = %e,
+            "count_files failed during rehydrate; adopting base with count 0");
+        0
+    });
     Ok(Some(RepoSnapshot {
         repo,
         head,
@@ -136,19 +142,21 @@ pub(crate) async fn rehydrate_offloaded(
 }
 
 /// Count regular files under `dir`, recursively (matches what the backends'
-/// materialize/copy steps count).
+/// materialize/copy steps count). Recurses over `std::path::Path` so a
+/// non-UTF-8 filename is counted, not turned into an error.
 fn count_files(dir: &Utf8Path) -> Result<usize> {
-    let mut count = 0;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            let sub = Utf8PathBuf::from_path_buf(entry.path())
-                .map_err(|p| CoreError::Vcs(format!("non-utf8 path: {}", p.display())))?;
-            count += count_files(&sub)?;
-        } else if ft.is_file() {
-            count += 1;
+    fn walk(dir: &std::path::Path) -> std::io::Result<usize> {
+        let mut count = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                count += walk(&entry.path())?;
+            } else if ft.is_file() {
+                count += 1;
+            }
         }
+        Ok(count)
     }
-    Ok(count)
+    Ok(walk(dir.as_std_path())?)
 }

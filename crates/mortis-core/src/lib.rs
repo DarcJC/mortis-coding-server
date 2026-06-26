@@ -34,7 +34,7 @@ pub use model::{
     FileContent, Principal, ReadRange, RepoId, Rev, SessionId, Timestamp, ensure_safe_relative,
     line_range, slice_file_content,
 };
-pub use search::{CaseMode, Flow, SearchEngine, SearchMatch, SearchQuery};
+pub use search::{CancelToken, CaseMode, Flow, SearchEngine, SearchMatch, SearchQuery};
 pub use session::{
     ChangeKind, EditOutcome, FileEdit, FileStatus, Replacement, Session, SessionStore,
 };
@@ -135,6 +135,7 @@ mod tests {
                 &self,
                 _v: &dyn FileView,
                 _q: &SearchQuery,
+                _cancel: &CancelToken,
                 sink: &mut dyn FnMut(SearchMatch) -> Flow,
             ) -> Result<()> {
                 for i in 0..1000u64 {

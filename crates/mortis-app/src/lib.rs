@@ -8,8 +8,8 @@
 pub mod registry;
 pub mod services;
 
-pub use registry::{BackendSet, RepoEntry, RepoRegistry};
-pub use services::{RepoInfo, Services};
+pub use registry::{BackendSet, BaseLease, RepoEntry, RepoRegistry};
+pub use services::{Limits, RepoInfo, Services};
 
 #[cfg(test)]
 mod tests {
@@ -79,6 +79,7 @@ mod tests {
             &self,
             _v: &dyn FileView,
             _q: &SearchQuery,
+            _cancel: &mortis_core::CancelToken,
             _s: &mut dyn FnMut(SearchMatch) -> mortis_core::Flow,
         ) -> Result<()> {
             Ok(())
@@ -94,6 +95,7 @@ mod tests {
             &self,
             _v: &dyn FileView,
             _q: &SearchQuery,
+            _cancel: &mortis_core::CancelToken,
             sink: &mut dyn FnMut(SearchMatch) -> mortis_core::Flow,
         ) -> Result<()> {
             for line_no in 1..=2u64 {
@@ -111,6 +113,61 @@ mod tests {
                 }
             }
             Ok(())
+        }
+    }
+
+    /// A backend whose head advances each sync, materializing `snapshots/rev<n>`
+    /// on disk. Used by GC/lease tests that need real snapshot dirs and head
+    /// advancement.
+    struct FakeGitSeq {
+        n: std::sync::atomic::AtomicU32,
+    }
+    impl FakeGitSeq {
+        fn new() -> Self {
+            Self { n: std::sync::atomic::AtomicU32::new(0) }
+        }
+    }
+    #[async_trait]
+    impl VcsBackend for FakeGitSeq {
+        fn kind(&self) -> VcsKind {
+            VcsKind::Git
+        }
+        async fn sync(&self, ctx: &RepoContext<'_>) -> Result<RepoSnapshot> {
+            let n = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let head = format!("rev{n}");
+            let base = ctx.snapshot_dir(&head);
+            std::fs::create_dir_all(&base).unwrap();
+            std::fs::write(base.join("f.txt"), b"x").unwrap();
+            Ok(RepoSnapshot {
+                repo: ctx.spec.id.clone(),
+                head,
+                base_path: base,
+                synced_at: Timestamp(n as u64),
+                file_count: 1,
+            })
+        }
+        async fn list_files(&self, _c: &RepoContext<'_>, _a: &Rev) -> Result<Vec<Utf8PathBuf>> {
+            Ok(vec![])
+        }
+        async fn read_file(
+            &self,
+            _c: &RepoContext<'_>,
+            p: &Utf8Path,
+            _a: &Rev,
+            r: Option<ReadRange>,
+        ) -> Result<FileContent> {
+            Ok(slice_file_content(p.to_owned(), b"", r))
+        }
+        async fn blame(&self, _c: &RepoContext<'_>, _p: &Utf8Path, _a: &Rev) -> Result<Vec<BlameLine>> {
+            Ok(vec![])
+        }
+        async fn history(
+            &self,
+            _c: &RepoContext<'_>,
+            _p: Option<&Utf8Path>,
+            _q: &LogQuery,
+        ) -> Result<Vec<Commit>> {
+            Ok(vec![])
         }
     }
 
@@ -245,7 +302,7 @@ mod tests {
     ) -> Services {
         let backends = BackendSet { git: Arc::new(FakeGit), svn: None };
         let reg = Arc::new(RepoRegistry::build(repos, tmp, &backends).unwrap());
-        Services::new(reg, search, Arc::new(NoSessions::default()), Arc::new(NoAsm))
+        Services::new(reg, search, Arc::new(NoSessions::default()), Arc::new(NoAsm), Limits::default())
     }
 
     #[tokio::test]
@@ -344,65 +401,15 @@ mod tests {
 
     #[tokio::test]
     async fn gc_keeps_current_and_referenced_reclaims_rest() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        // A backend whose head advances each sync, materializing snapshots/rev<n>.
-        struct FakeGitSeq {
-            n: AtomicU32,
-        }
-        #[async_trait]
-        impl VcsBackend for FakeGitSeq {
-            fn kind(&self) -> VcsKind {
-                VcsKind::Git
-            }
-            async fn sync(&self, ctx: &RepoContext<'_>) -> Result<RepoSnapshot> {
-                let n = self.n.fetch_add(1, Ordering::SeqCst) + 1;
-                let head = format!("rev{n}");
-                let base = ctx.snapshot_dir(&head);
-                std::fs::create_dir_all(&base).unwrap();
-                std::fs::write(base.join("f.txt"), b"x").unwrap();
-                Ok(RepoSnapshot {
-                    repo: ctx.spec.id.clone(),
-                    head,
-                    base_path: base,
-                    synced_at: Timestamp(n as u64),
-                    file_count: 1,
-                })
-            }
-            async fn list_files(&self, _c: &RepoContext<'_>, _a: &Rev) -> Result<Vec<Utf8PathBuf>> {
-                Ok(vec![])
-            }
-            async fn read_file(
-                &self,
-                _c: &RepoContext<'_>,
-                p: &Utf8Path,
-                _a: &Rev,
-                r: Option<ReadRange>,
-            ) -> Result<FileContent> {
-                Ok(slice_file_content(p.to_owned(), b"", r))
-            }
-            async fn blame(&self, _c: &RepoContext<'_>, _p: &Utf8Path, _a: &Rev) -> Result<Vec<BlameLine>> {
-                Ok(vec![])
-            }
-            async fn history(
-                &self,
-                _c: &RepoContext<'_>,
-                _p: Option<&Utf8Path>,
-                _q: &LogQuery,
-            ) -> Result<Vec<Commit>> {
-                Ok(vec![])
-            }
-        }
-
         let tmp = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
         let backends = BackendSet {
-            git: Arc::new(FakeGitSeq { n: AtomicU32::new(0) }),
+            git: Arc::new(FakeGitSeq::new()),
             svn: None,
         };
         let reg = Arc::new(RepoRegistry::build(vec![spec("r1", VcsKind::Git)], &root, &backends).unwrap());
         let sessions = Arc::new(NoSessions::default());
-        let svc = Services::new(reg, Arc::new(NoSearch), sessions.clone(), Arc::new(NoAsm));
+        let svc = Services::new(reg, Arc::new(NoSearch), sessions.clone(), Arc::new(NoAsm), Limits::default());
 
         // sync #1 -> snapshots/rev1 (current). Pretend a live session pins it.
         let snap1 = svc.sync_repo(&RepoId::from("r1")).await.unwrap();
@@ -422,6 +429,69 @@ mod tests {
         svc.gc_all_snapshots().await;
         assert!(!snap1.base_path.exists(), "unreferenced old snapshot reclaimed");
         assert!(snap2.base_path.exists(), "current snapshot still kept");
+    }
+
+    #[tokio::test]
+    async fn lease_pins_base_against_gc() {
+        // #5: a held lease must keep a base alive even after it stops being
+        // current, and releasing it lets GC reclaim it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let backends = BackendSet { git: Arc::new(FakeGitSeq::new()), svn: None };
+        let reg = Arc::new(RepoRegistry::build(vec![spec("r1", VcsKind::Git)], &root, &backends).unwrap());
+        let svc = Services::new(
+            reg,
+            Arc::new(NoSearch),
+            Arc::new(NoSessions::default()),
+            Arc::new(NoAsm),
+            Limits::default(),
+        );
+
+        // sync #1 → rev1; lease it (as an in-flight search would).
+        let snap1 = svc.sync_repo(&RepoId::from("r1")).await.unwrap();
+        let entry = svc.registry().get(&RepoId::from("r1")).unwrap();
+        let lease = entry.lease_current().expect("snapshot present");
+        assert_eq!(lease.base_path(), snap1.base_path.as_path());
+
+        // sync #2 → rev2; its in-sync GC runs while rev1 is leased.
+        let snap2 = svc.sync_repo(&RepoId::from("r1")).await.unwrap();
+        assert_ne!(snap1.base_path, snap2.base_path);
+        assert!(snap1.base_path.exists(), "leased base must survive GC");
+        assert!(snap2.base_path.exists(), "current base kept");
+
+        // Release the lease → GC reclaims rev1, keeps rev2 (current).
+        drop(lease);
+        svc.gc_all_snapshots().await;
+        assert!(!snap1.base_path.exists(), "unleased old base reclaimed");
+        assert!(snap2.base_path.exists());
+    }
+
+    #[tokio::test]
+    async fn create_session_over_current_base_succeeds() {
+        // #7: create_session resolves head/base via a lease over the current
+        // snapshot; the base it pins must exist (regression guard for the
+        // lease-based rewrite). The lease's GC protection is proven by
+        // `lease_pins_base_against_gc`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let backends = BackendSet { git: Arc::new(FakeGitSeq::new()), svn: None };
+        let reg = Arc::new(RepoRegistry::build(vec![spec("r1", VcsKind::Git)], &root, &backends).unwrap());
+        let svc = Services::new(
+            reg,
+            Arc::new(NoSearch),
+            Arc::new(NoSessions::default()),
+            Arc::new(NoAsm),
+            Limits::default(),
+        );
+
+        let snap = svc.sync_repo(&RepoId::from("r1")).await.unwrap();
+        let session = svc
+            .create_session(&Principal::from("alice"), &RepoId::from("r1"))
+            .await
+            .unwrap();
+        assert_eq!(session.base_path, snap.base_path);
+        svc.gc_all_snapshots().await;
+        assert!(snap.base_path.exists(), "session's (current) base survives GC");
     }
 
     #[test]

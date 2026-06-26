@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use axum::{Router, middleware::from_fn_with_state, routing::get};
 
-use mortis_app::{BackendSet, RepoRegistry, Services};
+use mortis_app::{BackendSet, Limits, RepoRegistry, Services};
 use mortis_asm::MemAssemblyStore;
 use mortis_search::GrepSearchEngine;
 use mortis_session::DiskSessionStore;
@@ -71,7 +71,9 @@ pub fn build_services(config: Config) -> anyhow::Result<(AppState, Arc<Services>
         .unwrap_or_else(|| data_dir.join("asm"));
     let asm = Arc::new(MemAssemblyStore::new(asm_dir, config.asm.policy())?);
 
-    let services = Arc::new(Services::new(registry, search, sessions, asm));
+    // `.max(1)` guards `buffered(0)`/`for_each_concurrent(0)` from a 0 in config.
+    let limits = Limits { repo_fanout: config.limits.repo_fanout.max(1) };
+    let services = Arc::new(Services::new(registry, search, sessions, asm, limits));
 
     let auth = Arc::new(Authenticator::new(&config.auth.tokens));
     let state = AppState {

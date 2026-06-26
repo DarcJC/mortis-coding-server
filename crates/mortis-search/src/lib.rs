@@ -20,7 +20,9 @@ use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 
-use mortis_core::{CaseMode, CoreError, FileView, Flow, Result, SearchEngine, SearchMatch, SearchQuery};
+use mortis_core::{
+    CancelToken, CaseMode, CoreError, FileView, Flow, Result, SearchEngine, SearchMatch, SearchQuery,
+};
 
 /// An embedded ripgrep-backed [`SearchEngine`].
 ///
@@ -85,6 +87,7 @@ impl SearchEngine for GrepSearchEngine {
         &self,
         view: &dyn FileView,
         query: &SearchQuery,
+        cancel: &CancelToken,
         sink: &mut dyn FnMut(SearchMatch) -> Flow,
     ) -> Result<()> {
         let matcher = Self::build_matcher(query)?;
@@ -102,6 +105,11 @@ impl SearchEngine for GrepSearchEngine {
         let candidates = view.list_files(subtree)?;
 
         for logical in candidates {
+            // Stop promptly if the caller cancelled (e.g. the search future was
+            // dropped on an early-break); bounds wasted work to one more file.
+            if cancel.is_cancelled() {
+                break;
+            }
             // Honor `globs`: keep only logical paths matching at least one glob.
             if let Some(set) = &globs {
                 if !set.is_match(logical.as_std_path()) {
@@ -551,12 +559,28 @@ mod tests {
 
         let mut count = 0;
         engine
-            .search_streaming(&view, &q, &mut |_m| {
+            .search_streaming(&view, &q, &CancelToken::new(), &mut |_m| {
                 count += 1;
                 Flow::Stop // stop after the very first match
             })
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn cancelled_search_yields_nothing() {
+        let (_t, view) = fixture();
+        let engine = GrepSearchEngine::new();
+        let q = SearchQuery::literal("fn"); // matches several fixture files
+
+        // A pre-cancelled token makes the per-file loop bail before any file.
+        let token = CancelToken::new();
+        token.cancel();
+        let hits = engine.search_cancellable(&view, &q, &token).unwrap();
+        assert!(hits.is_empty(), "a pre-cancelled search processes no files");
+
+        // Sanity: the same query without cancellation does find matches.
+        assert!(!engine.search(&view, &q).unwrap().is_empty());
     }
 
     #[test]

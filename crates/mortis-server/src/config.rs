@@ -22,6 +22,8 @@ pub struct Config {
     pub session: SessionConfig,
     #[serde(default)]
     pub asm: AsmConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
 }
 
 /// `[server]` section.
@@ -166,6 +168,24 @@ impl AsmConfig {
             max_sessions: self.max_sessions,
         }
     }
+}
+
+/// `[limits]` section: tunable concurrency / resource knobs.
+#[derive(Debug, Deserialize)]
+pub struct LimitsConfig {
+    /// Max repositories searched / rehydrated in parallel (default 4).
+    #[serde(default = "default_repo_fanout")]
+    pub repo_fanout: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self { repo_fanout: default_repo_fanout() }
+    }
+}
+
+fn default_repo_fanout() -> usize {
+    4
 }
 
 fn default_bind() -> String {

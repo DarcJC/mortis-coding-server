@@ -5,6 +5,9 @@
 //! It operates over any [`FileView`], so the same engine serves both bare repos
 //! and session overlays.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
@@ -97,23 +100,66 @@ pub enum Flow {
     Stop,
 }
 
+/// Cooperative cancellation flag for an in-progress search.
+///
+/// Deliberately a std `Arc<AtomicBool>` rather than `tokio_util::CancellationToken`
+/// so this crate (and `mortis-search`) stay free of any async runtime. The
+/// application flips it from a drop guard; the engine polls [`is_cancelled`] at
+/// file boundaries to stop a detached blocking walk promptly.
+///
+/// [`is_cancelled`]: CancelToken::is_cancelled
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    /// A fresh, not-yet-cancelled token.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation. Idempotent.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether cancellation has been requested. `Relaxed` suffices — this is a
+    /// best-effort early-exit hint, not a fence guarding other memory.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// An embedded code-search engine.
 pub trait SearchEngine: Send + Sync {
     /// Stream matches to `sink`, which may request early termination.
     ///
-    /// This is the primitive; [`SearchEngine::search`] is the buffered helper.
+    /// `cancel` is polled at file boundaries; a cancelled token stops the walk
+    /// promptly (used to abandon a detached blocking search whose future was
+    /// dropped). This is the primitive; [`SearchEngine::search`] is the buffered
+    /// helper.
     fn search_streaming(
         &self,
         view: &dyn FileView,
         query: &SearchQuery,
+        cancel: &CancelToken,
         sink: &mut dyn FnMut(SearchMatch) -> Flow,
     ) -> Result<()>;
 
     /// Collect all matches (respecting `max_results`) into a vector.
     fn search(&self, view: &dyn FileView, query: &SearchQuery) -> Result<Vec<SearchMatch>> {
+        self.search_cancellable(view, query, &CancelToken::new())
+    }
+
+    /// Like [`search`](SearchEngine::search) but cancellable via `cancel`.
+    fn search_cancellable(
+        &self,
+        view: &dyn FileView,
+        query: &SearchQuery,
+        cancel: &CancelToken,
+    ) -> Result<Vec<SearchMatch>> {
         let max = query.max_results;
         let mut out = Vec::new();
-        self.search_streaming(view, query, &mut |m| {
+        self.search_streaming(view, query, cancel, &mut |m| {
             out.push(m);
             match max {
                 Some(limit) if out.len() >= limit => Flow::Stop,
