@@ -126,6 +126,20 @@ pub trait VcsBackend: Send + Sync {
     /// materialize the whitelisted working tree. Returns a fresh snapshot.
     async fn sync(&self, ctx: &RepoContext<'_>) -> Result<RepoSnapshot>;
 
+    /// Recover in-memory snapshot state from the newest on-disk snapshot
+    /// directory, WITHOUT any network access. `Ok(None)` means nothing has been
+    /// published yet for this repo.
+    ///
+    /// Called at startup so reads/searches resolve a valid base immediately
+    /// instead of waiting for (or racing) the background initial [`sync`]. It is
+    /// best-effort: a stale pick is corrected the moment the next `sync` runs.
+    /// The default returns `Ok(None)`; real backends override it.
+    ///
+    /// [`sync`]: VcsBackend::sync
+    async fn rehydrate(&self, _ctx: &RepoContext<'_>) -> Result<Option<RepoSnapshot>> {
+        Ok(None)
+    }
+
     /// List logical file paths present at `at`.
     async fn list_files(&self, ctx: &RepoContext<'_>, at: &Rev) -> Result<Vec<Utf8PathBuf>>;
 

@@ -241,6 +241,10 @@ impl VcsBackend for SvnCliBackend {
         })
     }
 
+    async fn rehydrate(&self, ctx: &RepoContext<'_>) -> Result<Option<RepoSnapshot>> {
+        crate::publish::rehydrate_offloaded(ctx.spec.id.clone(), ctx.snapshots_dir()).await
+    }
+
     async fn list_files(&self, ctx: &RepoContext<'_>, at: &Rev) -> Result<Vec<Utf8PathBuf>> {
         let rev = rev_of(ctx, at);
         let out = self

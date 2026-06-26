@@ -276,6 +276,10 @@ impl VcsBackend for GixBackend {
         })
         .await
     }
+
+    async fn rehydrate(&self, ctx: &RepoContext<'_>) -> Result<Option<RepoSnapshot>> {
+        crate::publish::rehydrate_offloaded(ctx.spec.id.clone(), ctx.snapshots_dir()).await
+    }
 }
 
 /// Run blocking `gix` work on the blocking pool, flattening the join error.

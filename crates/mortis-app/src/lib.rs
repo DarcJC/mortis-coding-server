@@ -85,6 +85,35 @@ mod tests {
         }
     }
 
+    /// A search engine that emits two fixed matches per call, honoring the
+    /// sink's `Stop` (so `max_results` is respected per repo). Used to drive the
+    /// `search_all` orchestration without depending on real file content.
+    struct CountedSearch;
+    impl SearchEngine for CountedSearch {
+        fn search_streaming(
+            &self,
+            _v: &dyn FileView,
+            _q: &SearchQuery,
+            sink: &mut dyn FnMut(SearchMatch) -> mortis_core::Flow,
+        ) -> Result<()> {
+            for line_no in 1..=2u64 {
+                let m = SearchMatch {
+                    repo: None,
+                    path: Utf8PathBuf::from("hit.txt"),
+                    line_no,
+                    line: "x".into(),
+                    submatches: vec![],
+                    before: vec![],
+                    after: vec![],
+                };
+                if sink(m) == mortis_core::Flow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct NoSessions {
         /// Base paths a test wants `referenced_bases` to report (drives GC tests).
@@ -206,14 +235,17 @@ mod tests {
     }
 
     fn services_over(tmp: &Utf8Path, repos: Vec<RepoConfig>) -> Services {
+        services_over_search(tmp, repos, Arc::new(NoSearch))
+    }
+
+    fn services_over_search(
+        tmp: &Utf8Path,
+        repos: Vec<RepoConfig>,
+        search: Arc<dyn SearchEngine>,
+    ) -> Services {
         let backends = BackendSet { git: Arc::new(FakeGit), svn: None };
         let reg = Arc::new(RepoRegistry::build(repos, tmp, &backends).unwrap());
-        Services::new(
-            reg,
-            Arc::new(NoSearch),
-            Arc::new(NoSessions::default()),
-            Arc::new(NoAsm),
-        )
+        Services::new(reg, search, Arc::new(NoSessions::default()), Arc::new(NoAsm))
     }
 
     #[tokio::test]
@@ -243,6 +275,60 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), "conflict");
+    }
+
+    #[tokio::test]
+    async fn current_base_is_none_until_snapshot() {
+        // Locks in the FIX: an un-synced repo has NO base (so search returns
+        // empty) rather than falling back to the snapshots parent dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let svc = services_over(&root, vec![spec("r1", VcsKind::Git)]);
+        let entry = svc.registry().get(&RepoId::from("r1")).unwrap();
+
+        assert!(entry.current_base().is_none(), "no base before sync");
+
+        let snap = svc.sync_repo(&RepoId::from("r1")).await.unwrap();
+        assert_eq!(entry.current_base(), Some(snap.base_path));
+    }
+
+    #[tokio::test]
+    async fn search_all_merges_and_tags_across_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let svc = services_over_search(
+            &root,
+            vec![spec("r1", VcsKind::Git), spec("r2", VcsKind::Git)],
+            Arc::new(CountedSearch),
+        );
+        svc.sync_repo(&RepoId::from("r1")).await.unwrap();
+        svc.sync_repo(&RepoId::from("r2")).await.unwrap();
+
+        let hits = svc.search_all(SearchQuery::literal("x")).await.unwrap();
+        assert_eq!(hits.len(), 4, "2 matches per repo across 2 repos");
+        let tagged: std::collections::HashSet<RepoId> =
+            hits.iter().map(|m| m.repo.clone().unwrap()).collect();
+        let expected: std::collections::HashSet<RepoId> =
+            [RepoId::from("r1"), RepoId::from("r2")].into_iter().collect();
+        assert_eq!(tagged, expected);
+    }
+
+    #[tokio::test]
+    async fn search_all_respects_max_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let svc = services_over_search(
+            &root,
+            vec![spec("r1", VcsKind::Git), spec("r2", VcsKind::Git)],
+            Arc::new(CountedSearch),
+        );
+        svc.sync_repo(&RepoId::from("r1")).await.unwrap();
+        svc.sync_repo(&RepoId::from("r2")).await.unwrap();
+
+        let mut q = SearchQuery::literal("x");
+        q.max_results = Some(3);
+        let hits = svc.search_all(q).await.unwrap();
+        assert_eq!(hits.len(), 3, "merged results truncated to the global cap");
     }
 
     #[test]

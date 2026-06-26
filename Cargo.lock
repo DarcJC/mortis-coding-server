@@ -2485,6 +2485,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "camino",
+ "futures",
  "mortis-core",
  "mortis-fs",
  "serde",

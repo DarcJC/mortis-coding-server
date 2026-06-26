@@ -29,6 +29,18 @@ use mortis_fs::PhysicalFileView;
 
 use crate::registry::{RepoEntry, RepoRegistry};
 
+/// Max repositories processed in parallel for per-repo disk fan-out
+/// ([`Services::search_all`] and [`Services::rehydrate_all`]).
+///
+/// Each per-repo task offloads a blocking walk (ripgrep / `count_files`) onto
+/// the blocking pool, so this bounds both simultaneous blocking tasks and
+/// independent disk walks. Kept small: on a cold page cache / single spinning
+/// disk (the cold-start failure mode), unbounded fan-out just maximizes seek
+/// thrash. Four overlaps enough to hide per-repo latency on typical multi-repo
+/// configs without saturating one disk, and is far under tokio's default
+/// 512-thread blocking pool. Tunable up for SSD/NVMe.
+const REPO_FANOUT_CONCURRENCY: usize = 4;
+
 /// A read-side summary of one repository, for `list_repos`.
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoInfo {
@@ -106,6 +118,36 @@ impl Services {
         out
     }
 
+    /// Populate each repo's in-memory snapshot from the newest on-disk snapshot
+    /// (no network), so reads resolve a valid base immediately at startup —
+    /// before the background initial sync has run. Repos are processed with
+    /// bounded concurrency so a many-repo startup isn't delayed by the serial
+    /// sum of per-repo directory walks. Best-effort: per-repo failures are
+    /// logged and skipped, never fatal.
+    pub async fn rehydrate_all(&self) {
+        use futures::stream::{self, StreamExt};
+
+        stream::iter(self.repos.all())
+            .for_each_concurrent(REPO_FANOUT_CONCURRENCY, |entry| async move {
+                match entry.backend.rehydrate(&entry.context()).await {
+                    Ok(Some(snap)) => {
+                        tracing::info!(
+                            repo = %entry.spec.id, head = %snap.head, files = snap.file_count,
+                            "rehydrated snapshot from disk"
+                        );
+                        entry.set_snapshot(snap);
+                    }
+                    Ok(None) => {
+                        tracing::debug!(repo = %entry.spec.id, "no on-disk snapshot to rehydrate");
+                    }
+                    Err(e) => {
+                        tracing::warn!(repo = %entry.spec.id, error = %e, "snapshot rehydrate failed");
+                    }
+                }
+            })
+            .await;
+    }
+
     async fn sync_one(&self, entry: &Arc<RepoEntry>) -> Result<RepoSnapshot> {
         // Serialize syncs of this repo so the snapshot publish + GC below can't
         // race a concurrent (scheduled or manual) sync of the same repo.
@@ -149,7 +191,10 @@ impl Services {
     /// Search a single repository's materialized tree.
     pub async fn search_repo(&self, id: &RepoId, query: SearchQuery) -> Result<Vec<SearchMatch>> {
         let entry = self.repos.get(id)?;
-        let view = PhysicalFileView::new(entry.current_base());
+        let Some(base) = entry.current_base() else {
+            return Ok(Vec::new()); // not synced yet → no results (never walk the parent dir)
+        };
+        let view = PhysicalFileView::new(base);
         let mut hits = run_search(self.search.clone(), view, query).await?;
         for m in &mut hits {
             m.repo = Some(id.clone());
@@ -157,18 +202,45 @@ impl Services {
         Ok(hits)
     }
 
-    /// Search every repository, tagging matches with their repo id.
+    /// Search every repository concurrently (bounded), tagging matches with
+    /// their repo id. Repos are searched in repo-id order so a `max_results`
+    /// truncation keeps a reproducible subset; the search stops pulling once the
+    /// cap is met rather than walking every repo.
     pub async fn search_all(&self, query: SearchQuery) -> Result<Vec<SearchMatch>> {
+        use futures::stream::{self, StreamExt};
+
         let max = query.max_results;
+        // Stable id order: `repos.all()` is HashMap-arbitrary, so without this
+        // the surviving subset under `max_results` would vary across runs.
+        let mut entries = self.repos.all();
+        entries.sort_by(|a, b| a.spec.id.0.cmp(&b.spec.id.0));
+
+        // `buffered` runs up to N searches concurrently while yielding results
+        // in id order; we stop draining once `max_results` is satisfied so a
+        // capped query needn't walk every repo. (Any still-in-flight searches
+        // past the cap are dropped; their detached blocking walks finish unused.)
+        let mut stream = stream::iter(entries)
+            .map(|entry| {
+                let search = self.search.clone();
+                let query = query.clone();
+                async move {
+                    let Some(base) = entry.current_base() else {
+                        return Ok::<Vec<SearchMatch>, CoreError>(Vec::new());
+                    };
+                    let view = PhysicalFileView::new(base);
+                    let mut hits = run_search(search, view, query).await?;
+                    let id = entry.spec.id.clone();
+                    for m in &mut hits {
+                        m.repo = Some(id.clone());
+                    }
+                    Ok(hits)
+                }
+            })
+            .buffered(REPO_FANOUT_CONCURRENCY);
+
         let mut all = Vec::new();
-        for entry in self.repos.all() {
-            let view = PhysicalFileView::new(entry.current_base());
-            let mut hits = run_search(self.search.clone(), view, query.clone()).await?;
-            let id = entry.spec.id.clone();
-            for m in &mut hits {
-                m.repo = Some(id.clone());
-            }
-            all.append(&mut hits);
+        while let Some(hits) = stream.next().await {
+            all.extend(hits?);
             if let Some(limit) = max {
                 if all.len() >= limit {
                     all.truncate(limit);

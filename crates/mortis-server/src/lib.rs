@@ -143,6 +143,12 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         tracing::warn!("no [auth] tokens configured — every request will be rejected with 401");
     }
 
+    // Recover snapshots from disk (no network) BEFORE serving, so the first
+    // read/search resolves a valid base immediately instead of racing the
+    // background initial sync below — which would otherwise leave every repo's
+    // snapshot `None` and make the first search return empty / walk nothing.
+    services.rehydrate_all().await;
+
     {
         let services = services.clone();
         tokio::spawn(async move {

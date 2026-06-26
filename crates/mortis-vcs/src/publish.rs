@@ -7,7 +7,7 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 
-use mortis_core::{CoreError, Result};
+use mortis_core::{CoreError, RepoId, RepoSnapshot, Result, Timestamp};
 
 /// Materialize a snapshot for `head` under `snapshots_dir` and publish it
 /// atomically, returning `(base_path, file_count)`.
@@ -70,6 +70,69 @@ where
             Err(e.into())
         }
     }
+}
+
+/// Recover the newest published snapshot under `snapshots_dir` as a
+/// [`RepoSnapshot`], WITHOUT any network access. Returns `Ok(None)` when the
+/// directory is absent or holds no published snapshot.
+///
+/// Shared by the Git and SVN backends' `rehydrate`. Selection is by greatest
+/// directory mtime — a freshly published head is renamed into place last, so it
+/// has the newest mtime. The directory name only breaks exact mtime ties, for
+/// determinism; it is NOT a recency signal (head names are commit SHAs / svn
+/// revnums, whose lexical order is unrelated to time). In-progress publishes
+/// (`.staging-*`) are skipped. Best-effort: after a normal sync the post-sync
+/// GC leaves only the current head plus any session-pinned dirs, so this
+/// usually has a single candidate; whatever it picks, the next `sync`
+/// re-resolves the true head and replaces it.
+pub(crate) fn rehydrate_snapshot(
+    repo: RepoId,
+    snapshots_dir: &Utf8Path,
+) -> Result<Option<RepoSnapshot>> {
+    let Ok(read) = std::fs::read_dir(snapshots_dir) else {
+        return Ok(None); // never published (or unreadable) → nothing to rehydrate
+    };
+
+    // Published snapshot dirs only: real subdirectories, excluding in-progress
+    // `.staging-*` publishes and non-UTF-8 names (never a head we wrote).
+    let newest = read
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| {
+            let path = Utf8PathBuf::from_path_buf(e.path()).ok()?;
+            let name = path.file_name()?;
+            if name.starts_with(".staging-") {
+                return None;
+            }
+            let mtime = e.metadata().and_then(|m| m.modified()).ok();
+            Some((mtime, name.to_owned(), path))
+        })
+        .max_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+
+    let Some((mtime, head, base_path)) = newest else {
+        return Ok(None);
+    };
+    let file_count = count_files(&base_path)?;
+    Ok(Some(RepoSnapshot {
+        repo,
+        head,
+        base_path,
+        // The dir's own mtime ≈ when it was published — far truer than `now()`
+        // for a tree materialized in a previous process run.
+        synced_at: mtime.map(Timestamp::from_system).unwrap_or_else(Timestamp::now),
+        file_count,
+    }))
+}
+
+/// Run [`rehydrate_snapshot`] on the blocking pool. Shared by the Git and SVN
+/// `rehydrate` overrides so the offload + join-error mapping live in one place.
+pub(crate) async fn rehydrate_offloaded(
+    repo: RepoId,
+    snapshots_dir: Utf8PathBuf,
+) -> Result<Option<RepoSnapshot>> {
+    tokio::task::spawn_blocking(move || rehydrate_snapshot(repo, &snapshots_dir))
+        .await
+        .map_err(|e| CoreError::Other(format!("blocking task failed: {e}")))?
 }
 
 /// Count regular files under `dir`, recursively (matches what the backends'

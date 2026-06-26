@@ -47,13 +47,15 @@ impl RepoEntry {
         self.snapshot.read().expect("snapshot lock poisoned").clone()
     }
 
-    /// The current read/search base: the latest snapshot's materialized tree, or
-    /// a not-yet-created snapshot path (which yields empty results) if the repo
-    /// has never been synced.
-    pub fn current_base(&self) -> Utf8PathBuf {
-        self.snapshot()
-            .map(|s| s.base_path)
-            .unwrap_or_else(|| self.context().snapshots_dir())
+    /// The current read/search base: the latest snapshot's materialized tree,
+    /// or `None` if the repo has no snapshot yet.
+    ///
+    /// `None` means "contributes no search results". Callers must NOT fall back
+    /// to the snapshots parent dir — that directory holds *every* published head
+    /// (and any in-flight `.staging-*`), so walking it would search stale and
+    /// partial trees and blow the search budget on a cold cache.
+    pub fn current_base(&self) -> Option<Utf8PathBuf> {
+        self.snapshot().map(|s| s.base_path)
     }
 
     /// Record a fresh snapshot after a successful sync.

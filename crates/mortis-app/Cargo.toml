@@ -10,6 +10,7 @@ description = "Application service layer (facade) orchestrating the domain ports
 mortis-core = { workspace = true }
 mortis-fs = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 camino = { workspace = true }
